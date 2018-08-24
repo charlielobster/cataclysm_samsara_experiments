@@ -1,0 +1,130 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidParticlesToGrid.usf
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<uint> ParticleVoxels;
+StructuredBuffer<uint> InCount;
+
+Texture3D InSmoothDensity;
+SamplerState InSmoothDensitySampler;
+
+StructuredBuffer<float4> InPosInVox;
+
+#if USE_ANISO
+StructuredBuffer<uint> SortedParticleIndices;
+Texture2D VelocityTexture;
+#endif
+
+RWTexture3D<uint> OutUint32;
+
+#define UNROLL_TO MAX_SPLAT_COUNT
+#define BIG_DISTANCE 1000000
+#define USE_LARGE_SPLAT_RING 1
+
+#if USE_LARGE_SPLAT_RING
+#define SPLAT_WIDTH 5
+#else
+#define SPLAT_WIDTH 3
+#endif
+
+[numthreads(PARTICLES_TO_GRID_THREADS, SPLAT_WIDTH, 1)]
+void ParticlesToGrid(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	uint FistParticleInVoxelAndNum = ParticleVoxels[InputIndex];
+	uint VoxelIndex = FistParticleInVoxelAndNum >> 10;
+	uint NumInVox = FistParticleInVoxelAndNum & 0x3ff;
+
+	const uint3 ijkCell = PosInVoxToVoxelCoord(InPosInVox[VoxelIndex].xyz);
+
+	const int ko = DispatchThreadId.y;
+
+	uint Start = VoxelIndex;
+	uint End = VoxelIndex + NumInVox;
+
+	if (Start >= End) return;
+#if 1 // set to 0 to bypass shader.	
+	const float ParticleRadius = SurfaceSculpting.ParticleRadius;
+	const float IgnoreDensityBelow = abs(DomainVoxelInfo.SurfaceAtDensity); // NOTE THE OVERRIDDEN USE OF SURFACE AT DENSITY! SurfaceSculpting.IgnoreDensityBelow;
+
+	const int3 ijkMin = ijkCell - int3(SPLAT_WIDTH>>1, SPLAT_WIDTH>>1, SPLAT_WIDTH>>1);
+
+	float minDists[SPLAT_WIDTH * SPLAT_WIDTH];
+
+	[unroll(SPLAT_WIDTH * SPLAT_WIDTH)]
+	for (int i = 0; i < SPLAT_WIDTH * SPLAT_WIDTH; ++i)
+	{
+		minDists[i] = BIG_DISTANCE;
+	}
+
+	[unroll(UNROLL_TO)]
+	for (uint Index = Start; Index < End; ++Index)
+	{
+		// This uses \bar{X}
+		const float3 PositionInVoxel = InPosInVox[Index].xyz;
+
+		const float3 TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+
+		const float ParticleDensity = IgnoreDensityBelow ? Texture3DSample(InSmoothDensity, InSmoothDensitySampler, TexCoord) : 1;
+
+		if (ParticleDensity < IgnoreDensityBelow) continue;
+
+#if USE_ANISO
+		const uint ParticleIndex = SortedParticleIndices[Index];
+		const int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+		const float3 ParticleVelocity = mul(0.01f, VelocityTexture.Load(ParticleTexel).xyz);// cm to m
+		float3x3 G;
+		ComputeVelocityG(ParticleVelocity, G);
+		const float determ = determinant(G);
+#endif
+
+		// do the levelset splat
+		[unroll(SPLAT_WIDTH)]
+		for (int jo = 0; jo < SPLAT_WIDTH; jo++)
+		{
+			[unroll(SPLAT_WIDTH)]
+			for (int io = 0; io < SPLAT_WIDTH; io++)
+			{
+				const int i = (jo * SPLAT_WIDTH + io);
+				const int3 ijk = ijkMin + int3(io, jo, ko);
+				const float3 VoxelPosition = float3(ijk) + float3(0.5f, 0.5f, 0.5f);
+				const float3 Diff = VoxelPosition - PositionInVoxel;
+
+				// do the levelset splat
+#if USE_ANISO
+				float Len = length(mul(G, Diff));
+				minDists[i] = min(minDists[i], determ*Len);
+#else
+				float Len = length(Diff);
+				minDists[i] = min(minDists[i], Len);
+#endif
+			}
+		}
+	}
+
+	[unroll(SPLAT_WIDTH)]
+	for (int jo = 0; jo < SPLAT_WIDTH; jo++)
+	{
+		[unroll(SPLAT_WIDTH)]
+		for (int io = 0; io < SPLAT_WIDTH; io++)
+		{
+			const int i = (jo * SPLAT_WIDTH + io);
+			const int3 ijk = ijkMin + int3(io, jo, ko);
+
+			// levelset must be uint for InterlockedMax
+			const float ls = max(0, -(minDists[i] - ParticleRadius + SURFACE_LEVELSET_AT));
+			if (ls > 0)
+			{
+				InterlockedMax(OutUint32[ijk], asuint(ls));
+			}
+		}
+	}
+#endif // 0 or 1 to bypass or not
+}

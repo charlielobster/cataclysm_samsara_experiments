@@ -1,0 +1,76 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidExtendScalarVelocity.usf
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> InFloat;
+
+RWTexture3D<float> OutFloat;
+
+Texture3D<uint> InValidFlags;
+RWTexture3D<uint> OutValidFlags;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void ExtendScalarVelocity(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 ijk = GetActiveIndex(DispatchThreadId);
+
+	uint ValidFlags = InValidFlags[ijk];
+	float Flt = InFloat[ijk];
+#if 1
+	if (!(ValidFlags & VALID_FLAG))
+	{
+
+		const uint vfl = InValidFlags[ijk + int3(-1, 0, 0)];//left
+		const uint vfr = InValidFlags[ijk + int3(1, 0, 0)];//right
+		const uint vfd = InValidFlags[ijk + int3(0, -1, 0)];//down
+		const uint vfu = InValidFlags[ijk + int3(0, 1, 0)];//up
+		const uint vfb = InValidFlags[ijk + int3(0, 0, -1)];//back
+		const uint vff = InValidFlags[ijk + int3(0, 0, 1)];//front
+
+		float Num = 0;
+		Flt = 0;
+		if (vfl & VALID_FLAG)
+		{
+			Num += 1;
+			Flt += InFloat[ijk + int3(-1, 0, 0)];//left
+		}
+		if (vfr & VALID_FLAG)
+		{
+			Num += 1;
+			Flt += InFloat[ijk + int3(1, 0, 0)];//right
+		}
+		if (vfd & VALID_FLAG)
+		{
+			Num += 1;
+			Flt += InFloat[ijk + int3(0, -1, 0)];//down
+		}
+		if (vfu & VALID_FLAG)
+		{
+			Num += 1;
+			Flt += InFloat[ijk + int3(0, 1, 0)];//up
+		}
+		if (vfb & VALID_FLAG)
+		{
+			Num += 1;
+			Flt += InFloat[ijk + int3(0, 0, -1)];//back
+		}
+		if (vff & VALID_FLAG)
+		{
+			Num += 1;
+			Flt += InFloat[ijk + int3(0, 0, 1)];//front
+		}
+		if (Num)
+		{
+			ValidFlags += VALID_FLAG;
+			Flt /= Num;
+		}
+	}
+#endif
+	OutFloat[ijk] = Flt;
+	OutValidFlags[ijk] = ValidFlags;
+}

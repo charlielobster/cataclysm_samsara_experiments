@@ -1,0 +1,105 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidPrepLevelsetSplat
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D LiquidBoundary;
+#if LS_MULTIPLIER == 2
+SamplerState LiquidBoundarySampler;
+#endif
+
+#define OUTPUT_IS_UINT 1
+
+#if OUTPUT_IS_UINT
+// Treating this as a float, but doing InterlockedMin, so the value must be positive instead of negative.  So watch for that.
+RWTexture3D<uint> OutLiquidSurfaceUint32;
+#else
+RWTexture3D<float> OutLiquidSurfaceUint32;
+#endif
+
+#if 1
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void PrepLevelsetSplat(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint3 ijk = GetActiveIndexLS(DispatchThreadId);
+	const float SurfaceOffset = SurfaceSculpting.SurfaceOffset*LS_MULTIPLIER;
+#if 1
+#if LS_MULTIPLIER == 2
+	// If the levelset it at a higher resolution, then we will be splatting around the surface, but we need to fill the inside with something.
+	// The previously created LiquidBoundary values should work well for deep inside the fluid.
+	const float3 TexCoord = (float3(ijk) + float3(0.5f, 0.5f, 0.5f)) / float3(LS_DOMAIN_SIZE_X, LS_DOMAIN_SIZE_Y, LS_DOMAIN_SIZE_Z);
+	const float CrudeSurface = SurfaceOffset + LS_MULTIPLIER*(Texture3DSample(LiquidBoundary, LiquidBoundarySampler, TexCoord) - SURFACE_LEVELSET_AT);
+#else
+	const float CrudeSurface = SurfaceOffset + LiquidBoundary[ijk] - SURFACE_LEVELSET_AT;
+#endif
+
+#if OUTPUT_IS_UINT
+	const float ls = max(0, -(CrudeSurface + SURFACE_LEVELSET_AT));
+	OutLiquidSurfaceUint32[ijk] = asuint(ls);
+#else
+	OutLiquidSurfaceUint32[ijk] = CrudeSurface + SURFACE_LEVELSET_AT;
+#endif
+
+#else
+	// DEBUG TO CREATE A FLAT SURFACE AT SURFACE OFFSET!
+	float CrudeSurface = ijk.z - SurfaceOffset;
+#if OUTPUT_IS_UINT
+	const float ls = max(0, -(CrudeSurface + SURFACE_LEVELSET_AT));
+	OutLiquidSurfaceUint32[ijk] = asuint(ls);
+#else
+	OutLiquidSurfaceUint32[ijk] = CrudeSurface + SURFACE_LEVELSET_AT;
+#endif
+
+#endif
+}
+#else
+// test crap
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void PrepLevelsetSplat(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint3 ijk = GetActiveIndexLS(DispatchThreadId);
+	const float SurfaceAtDensity = max(0.001, abs(SurfaceSculpting.IgnoreDensityBelow));// IGNORE NOTICE!
+	float ls = 0;// alpha_N_rho;
+	float wtc = SurfaceAtDensity - LiquidBoundary[ijk + int3(0, 0, 0)];
+	float wtl = SurfaceAtDensity - LiquidBoundary[ijk + int3(-1, 0, 0)];
+	float wtr = SurfaceAtDensity - LiquidBoundary[ijk + int3(1, 0, 0)];
+	float wtd = SurfaceAtDensity - LiquidBoundary[ijk + int3(0, -1, 0)];
+	float wtu = SurfaceAtDensity - LiquidBoundary[ijk + int3(0, 1, 0)];
+	float wtb = SurfaceAtDensity - LiquidBoundary[ijk + int3(0, 0, -1)];
+	float wtf = SurfaceAtDensity - LiquidBoundary[ijk + int3(0, 0, 1)];
+	if (wtc < 0)
+	{
+		float dist = min(FractionInside(wtc, wtl), FractionInside(wtc, wtr));
+		dist = min(dist, FractionInside(wtc, wtd));
+		dist = min(dist, FractionInside(wtc, wtu));
+		dist = min(dist, FractionInside(wtc, wtb));
+		dist = min(dist, FractionInside(wtc, wtf));
+		//if (dist > SQRT_OF_3_OVER_2) dist = SQRT_OF_3_OVER_2;
+		ls = -dist;
+	}
+	else
+	{
+		float dist = min(FractionInside(-wtc, -wtl), FractionInside(-wtc, -wtr));
+		dist = min(dist, FractionInside(-wtc, -wtd));
+		dist = min(dist, FractionInside(-wtc, -wtu));
+		dist = min(dist, FractionInside(-wtc, -wtb));
+		dist = min(dist, FractionInside(-wtc, -wtf));
+		//if (dist > SQRT_OF_3_OVER_2) dist = SQRT_OF_3_OVER_2;
+		ls = dist;
+
+	}
+
+#if OUTPUT_IS_UINT
+	ls = max(0, -(ls + SURFACE_LEVELSET_AT));
+	OutLiquidSurfaceUint32[ijk] = asuint(ls);
+#else
+	OutLiquidSurfaceUint32[ijk] = ls + SURFACE_LEVELSET_AT;
+#endif
+
+
+}
+#endif

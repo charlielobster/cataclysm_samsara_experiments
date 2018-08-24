@@ -1,0 +1,369 @@
+// CATACLYSM
+
+#include "Common.usf"
+#include "SHCommon.usf"
+#include "VertexFactoryCommon.usf"
+#include "ReflectionEnvironmentShared.usf"
+#include "FluidRenderingCommon.usf"
+
+#if USE_HALF_RES_FOR_WAVE_NOISE_SPRITES && SHADER_PASS == 1
+#define RESOLUTION_SCALE 0.25f
+#define RESOLUTION_SCALE_INV 4.0f
+#else
+#define RESOLUTION_SCALE 1.0f
+#define RESOLUTION_SCALE_INV 1.0f
+#endif
+
+//------------------------------------------------------------------------------
+
+Texture2D		FluidDepthDistTexture;
+SamplerState	FluidDepthDistTextureSampler;
+
+float SurfaceDepthOffset;
+
+
+float4 GetFluidWorldPosition(float2 ScreenUV, float2 ScreenPosition)
+{
+	float FluidDepth = FluidDepthTexture.SampleLevel(FluidDepthTextureSampler, ScreenUV, 0).x;
+	//float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * FluidDepth, FluidDepth, 1), View.ScreenToWorld);
+	//return float4(HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w, Depth);
+	float3 ViewVector = mul(float4(ScreenPosition.xy, 1, 0), View.ScreenToWorld).xyz;
+	////TODO this faster or even correct? float3 ViewVector = ScreenPosition.x*View.ScreenToWorld._m00_m01_m02 + ScreenPosition.y*View.ScreenToWorld._m10_m11_m12 + View.ScreenToWorld._m20_m21_m22;
+	return float4(ViewVector * FluidDepth + View.WorldCameraOrigin.xyz, FluidDepth);
+}
+
+float4 GetFluidWorldPosition(float2 ScreenUV)
+{
+	float2 ScreenPosition = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	return GetFluidWorldPosition(ScreenUV, ScreenPosition);
+}
+
+float4 GetFluidWorldPosition(float4 SvPosition)
+{
+	float2 ScreenPos = ((SvPosition.xy - View.ViewRectMin.xy * RESOLUTION_SCALE) * View.ViewSizeAndInvSize.zw * RESOLUTION_SCALE_INV - 0.5) * float2(2, -2);
+	float2 ScreenUV = (ScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz);
+
+	return GetFluidWorldPosition(ScreenUV, ScreenPos);
+}
+
+//------------------------------------------------------------------------------
+
+StructuredBuffer<uint> ParticleIndices;
+Texture2D ParticlesPositionTexture;
+Texture2D ParticlesTexCoord0Texture;
+Texture2D ParticlesTexCoord1Texture;
+
+float ParticleRadius;
+
+struct VS_Output
+{
+	float4 ClipPosition : Position;
+#if SHADER_PASS == 1
+	float4 WorldPos : TEXCOORD0;
+	float4 TexCoords : TEXCOORD1;
+#endif
+};
+
+VS_Output VSMain(uint VertexIndex : SV_VertexID)
+{
+	uint ParticleIndex = ParticleIndices[VertexIndex];
+	int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+	const float4 ParticlePosition = ParticlesPositionTexture.Load(ParticleTexel);
+
+	VS_Output Out;
+	Out.ClipPosition = mul(float4(ParticlePosition.xyz, 1), View.WorldToClip);
+#if SHADER_PASS == 0 && USE_CONSERVATIVE_DEPTH
+	Out.ClipPosition.z = ConvertToDeviceZ(Out.ClipPosition.w - ParticleRadius) * Out.ClipPosition.w;
+#endif
+#if SHADER_PASS == 1
+	Out.WorldPos = ParticlePosition;
+	Out.TexCoords.xy = ParticlesTexCoord0Texture.Load(ParticleTexel).xy;
+	Out.TexCoords.zw = ParticlesTexCoord1Texture.Load(ParticleTexel).xy;
+#endif
+	return Out;
+}
+
+struct GS_Output
+{
+	noperspective centroid float4 Position : SV_POSITION;
+	noperspective centroid float2 TexCoord : TEXCOORD0;
+#if SHADER_PASS == 1
+	noperspective centroid float4 CenterWorldPos : TEXCOORD1;
+	noperspective centroid float4 CenterTexCoords : TEXCOORD2;
+#endif
+};
+
+static const float2 QuadOffsets[4] =
+{
+	float2(-1,  1),
+	float2( 1,  1),
+	float2(-1, -1),
+	float2( 1, -1),
+};
+
+[maxvertexcount(4)]
+void GSMain(point VS_Output In[1], inout TriangleStream<GS_Output> OutStream)
+{
+	float2 ClipExtent = ParticleRadius * float2(View.ViewToClip[0][0], View.ViewToClip[1][1]);
+
+	GS_Output Out;
+	// Emit two new triangles
+	for ( int i=0; i < 4; i++ )
+	{
+		// Transform to clip space
+		float4 ClipPosition = In[0].ClipPosition; ClipPosition.xy += QuadOffsets[i] * ClipExtent;
+		Out.Position = ClipPosition;
+		Out.TexCoord = QuadOffsets[i];
+#if SHADER_PASS == 1
+		Out.CenterWorldPos = In[0].WorldPos;
+		Out.CenterTexCoords = In[0].TexCoords;
+#endif
+		OutStream.Append(Out);
+	}
+	OutStream.RestartStrip();
+}
+
+#if SHADER_PASS == 1
+[earlydepthstencil]
+#endif
+void PSMain(
+	GS_Output In,
+	out float4 OutColor : SV_Target0
+#if SHADER_PASS == 0
+	,
+#if HAS_INVERTED_Z_BUFFER
+#if USE_CONSERVATIVE_DEPTH
+	out float OutDepth : SV_DepthLessEqual
+#else
+	out float OutDepth : SV_Depth
+#endif
+#else
+#error Fix me!
+#endif
+#endif
+#if SHADER_PASS == 1
+	,
+	out float OutColorW : SV_Target1
+#endif
+	)
+{
+	float RadiusSq = dot(In.TexCoord, In.TexCoord);
+	if (RadiusSq > 1)
+	{
+#if SHADER_PASS == 0
+		OutDepth = 0.0f;
+#endif
+		discard;
+	}
+	else
+	{
+#if SHADER_PASS == 0
+		float Height = sqrt(1 - RadiusSq);
+		float FluidDepth = In.Position.w - Height * ParticleRadius;
+		OutColor = float4(FluidDepth, 0, 0, 0);
+		OutDepth = ConvertToDeviceZ(FluidDepth + SurfaceDepthOffset);
+#else
+		float4 WorldPos = GetFluidWorldPosition(In.Position);
+		float3 WorldDiff = WorldPos.xyz - In.CenterWorldPos.xyz;
+		float WorldDiffSq = dot(WorldDiff, WorldDiff);
+		WorldDiffSq /= ParticleRadius * ParticleRadius;
+		if (WorldDiffSq > 1)
+		{
+			discard;
+		}
+		else
+		{
+			float W = (1 - WorldDiffSq*1.0f);
+			OutColor = (In.CenterTexCoords + WorldDiff.xyxy) * W;
+			OutColorW = W;
+	}
+#endif
+	}
+}
+
+
+void PSFinal(in float4 UVAndScreenPos : TEXCOORD0, out float3 OutColor : SV_Target0, out float OutDepth : SV_Depth)
+{
+#if 0
+	float nv = (PerlinNoise2D_ALU(UVAndScreenPos.xy*100)+1)*0.5;
+	OutColor = float3(frac(max(-nv,0)), frac(max(+nv,0)), 0);
+	OutDepth = 1.0f;
+#else
+	float2 ScreenUV = UVAndScreenPos.xy;
+	float SceneDepth = CalcSceneDepth(ScreenUV);
+	float FluidDepth = FluidDepthTexture.SampleLevel(FluidDepthTextureSampler, ScreenUV, 0).x;
+
+	//return float4(saturate(FluidDepth / 10000.0f), 0, 0, 0);
+
+	if (FluidDepth >= SceneDepth)
+	{
+		discard;
+	}
+
+	float FluidDist = FluidDepthDistTexture.SampleLevel(FluidDepthDistTextureSampler, ScreenUV, 0).x;
+	//return float4(0, FluidDist / 100.0f, 0, 1);
+
+	float3 ViewVector = mul(float4(UVAndScreenPos.zw, 1, 0), View.ScreenToWorld).xyz;
+	float4 WorldPos = float4(ViewVector * FluidDepth + View.WorldCameraOrigin.xyz, 1);
+
+	float3 VoxelPos = mul(WorldPos, WorldToVolume).xyz * float3(R_DOMAIN_SIZE_X, R_DOMAIN_SIZE_Y, R_DOMAIN_SIZE_Z);
+
+	float3 SurfGrad = CalcSurfaceGrad(VoxelPos);
+	float3 Normal = normalize(SurfGrad);
+
+	float3 ViewDir = normalize(ViewVector);
+
+	WaterShaderImpl WaterShader;
+	WaterShader.Init(ViewDir, ScreenUV, ScreenUV * View.BufferSizeAndInvSize.xy);
+
+	WaterShader.OnEnterSurface(Normal, WorldPos.xyz, FluidDepth);
+	WaterShader.OnExitSurface(VoxelPos, FluidDist);
+
+	OutColor = WaterShader.GetFinalColor();
+#endif
+	OutDepth = ConvertToDeviceZ(FluidDepth + ScreenDepthOffset);
+	//return float4(saturate(FluidDepth / 1000.0f), 0, 0, 0);
+	// screen position in [-1, 1] screen space 
+#if 0
+	float3 ViewVector = mul(float4(UVAndScreenPos.zw, 1, 0), View.ScreenToWorld).xyz;
+	float4 WorldPos = float4(ViewVector * FluidDepth + View.WorldCameraOrigin.xyz, FluidDepth);
+
+	//calc. surface normal
+	const float3 TexelSize = float3(View.BufferSizeAndInvSize.zw, 0);
+
+	float4 ddxP = GetFluidWorldPosition(ScreenUV + TexelSize.xz) - WorldPos;
+	float4 ddxN = WorldPos - GetFluidWorldPosition(ScreenUV - TexelSize.xz);
+	float4 ddyP = GetFluidWorldPosition(ScreenUV + TexelSize.zy) - WorldPos;
+	float4 ddyN = WorldPos - GetFluidWorldPosition(ScreenUV - TexelSize.zy);
+
+	float4 TangentX = abs(ddxP.w) < abs(ddxN.w) ? ddxP : ddxN;
+	float4 TangentY = abs(ddyP.w) < abs(ddyN.w) ? ddyP : ddyN;
+
+	//return float4(normalize(cross(TangentX.xyz, TangentY.xyz)), 1);
+	//return float4(abs(TangentX.w), abs(TangentY.w), 0, 0);
+
+	float3 WorldNormal = cross(TangentX.xyz, TangentY.xyz);
+
+	return float4(WorldNormal, 1);
+#endif
+}
+
+//------------------------------------------------------------------------------
+struct VSSurface_Output
+{
+	float4 Position : SV_POSITION;
+	float4 VolumePos : TEXCOORD0;
+};
+
+VSSurface_Output VSSurface(float3 Pos : ATTRIBUTE0)
+{
+	VSSurface_Output Out;
+	Out.VolumePos = float4(Pos, 1);
+	float4 WorldPos = mul(Out.VolumePos, VolumeToWorld);
+	Out.Position = mul(WorldPos, View.WorldToClip);
+	return Out;
+}
+
+class TraceCallback : ITraceCallback
+{
+	float4 lastPos;
+	bool bLastInside;
+	bool bHasResult;
+
+	float FluidDepth;
+	float FluidDist;
+
+	float WorldRayDirLen;
+
+	void init(float4 rayBeg, float3 rayDir)
+	{
+		lastPos = rayBeg;
+		lastPos.xyz *= float3(R_DOMAIN_SIZE_X, R_DOMAIN_SIZE_Y, R_DOMAIN_SIZE_Z);
+		bLastInside = (getSurfaceValue(lastPos.xyz) < 0);
+		bHasResult = bLastInside;
+		FluidDepth = lastPos.w;
+		FluidDist = 0.0f;
+
+		WorldRayDirLen = length( mul(rayDir, (float3x3)VolumeToWorld) );
+	}
+	bool LastInside() { return bLastInside; }
+	bool HasWaterShader() { return false; }
+	bool HasResult() { return bHasResult; }
+	void SetHasResult(bool hr) { bHasResult = hr; }
+	void SetLastInside(bool hr) { bLastInside = hr; }
+	void SetLastPos(float4 lp) { lastPos = lp; }
+	float4 GetLastPos() { return lastPos; }
+	float GetWorldRayDirLen() { return WorldRayDirLen; }
+	void AddFluidDist(float Distance) { FluidDist += Distance; }
+	void SetDepth(float Dep) { FluidDepth = Dep; }
+	void SetWaterShaderDebug(float3 N) {}
+	void WaterShaderOnExitSurface(float4 surfPos) {}
+	void WaterShaderOnEnterSurface(float4 surfPos) {}
+
+	bool onIntersect(float4 surfPos, float f0, float f1)
+	{
+		if (bLastInside)
+		{//trace out of water volume
+			float Distance = (surfPos.w - lastPos.w) * WorldRayDirLen;
+			//float Density = GetDensityValue((surfPos.xyz + lastPos.xyz) * 0.5f);
+			//BlobCull check
+			//if (any(float2(Distance, Density) >= BlobCullInfo))
+			if (Distance >= BlobCullInfo.x)
+			{
+				FluidDist += Distance;
+				if (!bHasResult)
+				{
+					FluidDepth = lastPos.w;
+					bHasResult = true;
+				}
+			}
+			bLastInside = false;
+		}
+		else
+		{//trace into water volume
+			bLastInside = true;
+		}
+		lastPos = surfPos;
+		return false; /* false = continue tracing! */
+
+	}
+
+	void finish(float4 rayEnd)
+	{
+		if (bLastInside)
+		{
+			rayEnd.xyz *= float3(R_DOMAIN_SIZE_X, R_DOMAIN_SIZE_Y, R_DOMAIN_SIZE_Z);
+			onIntersect(rayEnd, 0, 0);
+		}
+	}
+};
+
+void PSSurface(VSSurface_Output In, out float OutFluidDepth : SV_Target0, out float OutFluidDist : SV_Target1, out float OutDepth : SV_Depth)
+{
+	float3 rayDir;
+	float4 rayBeg, rayEnd;
+
+	float2 ScreenPos = ((In.Position.xy - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw - 0.5) * float2(2, -2);
+	float2 ScreenUV = (ScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz);
+	float SceneDepth = CalcSceneDepth(ScreenUV);
+
+	if (getCameraRay(In.Position, In.VolumePos, SceneDepth, rayDir, rayBeg, rayEnd))
+	{
+		TraceCallback callback;
+		callback.init(rayBeg, rayDir);
+
+		traceGrid(callback, rayBeg, rayEnd, rayDir);
+
+		callback.finish(rayEnd);
+
+		if (callback.bHasResult)
+		{
+			OutFluidDepth = callback.FluidDepth;
+			OutFluidDist = callback.FluidDist;
+			OutDepth = ConvertToDeviceZ(callback.FluidDepth + SurfaceDepthOffset);
+			return;
+		}
+	}
+	discard;
+	OutDepth = 0.0f; //far
+}

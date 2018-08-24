@@ -1,0 +1,140 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidDivergenceShader.usf: Shader to divergence liquid surface
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<uint> InVoxels;
+StructuredBuffer<uint> InCount;
+Texture3D<float> InU;
+Texture3D<float> InV;
+Texture3D<float> InW;
+Texture3D<float> LiquidBoundary;
+Texture3D<uint> Weights;
+
+RWStructuredBuffer<float4> OutPressureSolverParams;
+
+[numthreads(PRESSURE_SOLVE_THREADS, 1, 1)]
+void DivergenceLiquid(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	const uint3 ijk = IdxToVoxelAddress(InVoxels[InputIndex]);
+
+	float Div = 0;
+	const float ls000 = LiquidBoundary[ijk] - SURFACE_LEVELSET_AT;
+	float Diag = 0;
+	const float dx = DomainVoxelInfo.VoxelWidth*0.01;// voxelWidth is in cm, make it meters for the solver.
+
+	// Check for solid cells on the faces.	
+	const float vl = InU[ijk];
+	const float vr = InU[ijk + int3(1, 0, 0)];
+	const float vd = InV[ijk];
+	const float vu = InV[ijk + int3(0, 1, 0)];
+	const float vb = InW[ijk];
+	const float vf = InW[ijk + int3(0, 0, 1)];
+
+	const float lsl = LiquidBoundary[ijk + int3(-1, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float lsr = LiquidBoundary[ijk + int3(1, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float lsd = LiquidBoundary[ijk + int3(0, -1, 0)] - SURFACE_LEVELSET_AT;
+	const float lsu = LiquidBoundary[ijk + int3(0, 1, 0)] - SURFACE_LEVELSET_AT;
+	const float lsb = LiquidBoundary[ijk + int3(0, 0, -1)] - SURFACE_LEVELSET_AT;
+	const float lsf = LiquidBoundary[ijk + int3(0, 0, 1)] - SURFACE_LEVELSET_AT;
+
+	// Get the liquid fractions
+	uint uWeights = Weights[ijk];
+	uint uWeightsOff = (Weights[ijk + int3(1, 0, 0)] & 0x3ff00000) | (Weights[ijk + int3(0, 1, 0)] & 0x000ffc00) | (Weights[ijk + int3(0, 0, 1)] & 0x000003ff);
+	const float3 Weights000 = GetLiquidFractions(uWeights);
+	const float lfl = Weights000.x;
+	const float lfd = Weights000.y;
+	const float lfb = Weights000.z;
+	const float3 WeightsOff = GetLiquidFractions(uWeightsOff);
+	const float lfr = WeightsOff.x;
+	const float lfu = WeightsOff.y;
+	const float lff = WeightsOff.z;
+
+	// TODO Should these be used if there is a ghost value?
+	float dl = lfl * vl;
+	float dr = lfr * vr;
+	float dd = lfd * vd;
+	float du = lfu * vu;
+	float db = lfb * vb;
+	float df = lff * vf;
+	
+	// left
+	if (lsl < 0)
+	{
+		// liquid to the left
+		Diag += lfl;
+	}
+	else
+	{
+		// free boundary to left
+		float theta = FractionInsideFast(ls000, lsl);
+		Diag += lfl / theta;
+	}
+
+	// right
+	if (lsr < 0)
+	{
+		Diag += lfr;
+	}
+	else
+	{
+		float theta = FractionInsideFast(ls000, lsr);
+		Diag += lfr / theta;
+	}
+
+	// down
+	if (lsd < 0)
+	{
+		Diag += lfd;
+	}
+	else
+	{
+		float theta = FractionInsideFast(ls000, lsd);
+		Diag += lfd / theta;
+	}
+
+	// up
+	if (lsu < 0)
+	{
+		Diag += lfu;
+	}
+	else
+	{
+		float theta = FractionInsideFast(ls000, lsu);
+		Diag += lfu / theta;
+	}
+
+	// back
+	if (lsb < 0)
+	{
+		Diag += lfb;
+	}
+	else
+	{
+		float theta = FractionInsideFast(ls000, lsb);
+		Diag += lfb / theta;
+	}
+
+	// front
+	if (lsf < 0)
+	{
+		Diag += lff;
+	}
+	else
+	{
+		float theta = FractionInsideFast(ls000, lsf);
+		Diag += lff / theta;
+	}
+	
+	Div = -(dr - dl + du - dd + df - db) * dx; // pre-multiply by dx^2
+	Diag = Diag ? 1.0f / Diag : Diag;
+
+	OutPressureSolverParams[InputIndex] = float4(asfloat(uWeights), asfloat(uWeightsOff), Diag, Div);
+}

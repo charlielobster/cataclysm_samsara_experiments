@@ -1,0 +1,58 @@
+// CATACLYSM 
+
+/*==============================================================================
+FluidCoverSprayParticles
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Buffer<float> InVertexBuffer; 
+RWBuffer<float> OutVertexBuffer;
+
+StructuredBuffer<SprayParticleCreatePointData> NewSprayParticles;
+
+[numthreads(256, 1, 1)]
+void CoverSprayParticles(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Buffer offsets.
+	uint InputIndex = DispatchThreadId.x;
+
+	if (InputIndex < SprayParticleInfo.ParticlesThisDrawCall)
+	{
+		const uint vertexElementsCount = 18;
+		uint startOffset = InputIndex * vertexElementsCount;
+		for (uint i = 0; i < vertexElementsCount; i++)
+		{
+			OutVertexBuffer[startOffset + i] = InVertexBuffer[startOffset + i];
+		}
+
+		float4 finalPosition = 0;
+		float4 finalVelocity = 0;
+		BRANCH
+		if ((SprayParticleInfo.SprayParticleCount > SprayParticleInfo.FirstParticle) 
+			&& (InputIndex < (SprayParticleInfo.SprayParticleCount - SprayParticleInfo.FirstParticle)))
+		{
+			float3 position = NewSprayParticles[InputIndex + SprayParticleInfo.FirstParticle].position.xyz;
+			float3 velocity = NewSprayParticles[InputIndex + SprayParticleInfo.FirstParticle].velocity.xyz;
+
+			finalPosition = float4(position.xyz, InVertexBuffer[startOffset + 3]);		// store pos.x
+			finalVelocity = float4(velocity.xyz, InVertexBuffer[startOffset + 7]);
+		}
+		else
+		{
+			finalPosition = float4(InVertexBuffer[startOffset + 0], InVertexBuffer[startOffset + 1], InVertexBuffer[startOffset + 2],2.0);
+			finalVelocity = float4(InVertexBuffer[startOffset + 4], InVertexBuffer[startOffset + 5], InVertexBuffer[startOffset + 6], InVertexBuffer[startOffset + 7]);
+		}
+
+		OutVertexBuffer[startOffset + 0] = finalPosition.x;		// store pos.x
+		OutVertexBuffer[startOffset + 1] = finalPosition.y;		// store pos.y
+		OutVertexBuffer[startOffset + 2] = finalPosition.z;		// store pos.z
+		OutVertexBuffer[startOffset + 3] = finalPosition.w;		
+
+		OutVertexBuffer[startOffset + 4] = finalVelocity.x;		// store velocity.x
+		OutVertexBuffer[startOffset + 5] = finalVelocity.y;		// store velocity.y
+		OutVertexBuffer[startOffset + 6] = finalVelocity.z;		// store velocity.z
+		OutVertexBuffer[startOffset + 7] = finalVelocity.w;
+	}
+}

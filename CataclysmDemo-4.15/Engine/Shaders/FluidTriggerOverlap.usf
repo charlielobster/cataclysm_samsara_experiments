@@ -1,0 +1,77 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidTriggerOverlap.usf: Compute the trigger overlap with liquid.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D LiquidSurfaceTexture;
+SamplerState LiquidSurfaceTextureSampler;
+
+StructuredBuffer<uint> OverlapState;
+
+RWStructuredBuffer<uint> OutOverlapState;
+AppendStructuredBuffer<uint> OutChangedOverlapState;
+
+#define SIDES_COUNT	(7)
+
+uint GetSurfaceState(float3 WorldPosition)
+{
+	// We only need texcoord here. so levelset multiplier don't be cared.
+	float3 PositionInVoxel = WorldToVoxel(WorldPosition);
+	float3 TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+
+	const float Surface = Texture3DSample(LiquidSurfaceTexture, LiquidSurfaceTextureSampler, TexCoord);
+	return Surface < SURFACE_LEVELSET_AT;
+}
+
+[numthreads(MAX_FLUID_TRIGGERS, 1, 1)]
+void TriggerOverlap( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	const float3 Sides[SIDES_COUNT] = {
+		0, 0, 0,
+		0, 0, 0.5f,
+		0, 0, -0.5f,
+		0, 0.5f, 0,
+		0, -0.5f, 0,
+		0.5f, 0, 0,
+		-0.5f, 0, 0
+	};
+
+	uint Index = DispatchThreadId.x;
+	if ( Index < FluidTriggers.Count )
+	{
+		uint LastState = OverlapState[Index];
+		uint CurrentState = 0;
+
+		for(int SideIndex = 0; SideIndex < SIDES_COUNT; SideIndex++)
+		{
+			float3 VolumeCenter = mul(float4(FluidTriggers.CenterPos[Index], 1.0f), FluidTriggers.WorldToVolume[Index]).xyz;
+			float3 VolumePos = VolumeCenter + Sides[SideIndex] * FluidTriggers.VolumeSize[Index];
+			float3 WorldPos = mul(float4(VolumePos, 1), FluidTriggers.VolumeToWorld[Index]).xyz;
+			CurrentState = GetSurfaceState(WorldPos);
+			if(CurrentState == 1)
+			{
+				break;
+			}
+		}
+
+		// Begin Overlap
+		if (LastState == 0 && CurrentState > 0)
+		{
+			// TODO: more info need to be output
+			OutChangedOverlapState.Append(Index);
+		}
+
+		// End Overlap
+		if (LastState > 0 && CurrentState == 0)
+		{
+			// TODO: more info need to be output
+			OutChangedOverlapState.Append(Index | 0x80000000);
+		}
+
+		OutOverlapState[Index] = CurrentState;
+	}
+}

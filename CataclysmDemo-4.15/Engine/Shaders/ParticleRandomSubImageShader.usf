@@ -1,0 +1,68 @@
+// Copyright 1998-2015 Epic Games, Inc. All Rights Reserved.
+
+/*==============================================================================
+	ParticleSimulationShader.usf: Shaders for simulating particles on the GPU.
+==============================================================================*/
+
+#include "Common.usf"
+
+struct FShaderInterpolants
+{
+	/** The texture coordinate at which to sample. */
+	float2 TexCoord : TEXCOORD0;
+};
+
+/** Texture from which to read particle position. */
+Texture2D PositionTexture;
+SamplerState PositionTextureSampler;
+/** Texture from which to read particle velocity. */
+Texture2D VelocityTexture;
+SamplerState VelocityTextureSampler;
+
+Texture2D RandomSubImageTexture;
+SamplerState RandomSubImageTextureSampler;
+
+float DeltaSeconds;
+
+float2 ComputeRandomSubImage(float2 UV, float RelativeTime)
+{
+	const float2 RandomSubImageSample = Texture2DSample(RandomSubImageTexture, RandomSubImageTextureSampler, UV);
+
+	float SubUVTime = RandomSubImageSample.r;
+	float OutImageIndex = RandomSubImageSample.g;
+
+	if (RelativeTime <= 1.0f)
+	{
+		if(SubUVTime == 0.0f || RelativeTime - SubUVTime > Simulation.RandomImageTime)
+		{
+			const float2 XY = UV * RelativeTime * Simulation.FrameNumber;
+			OutImageIndex = PseudoRandom(XY) * Simulation.TotalSubImages;
+			float Frac = frac(OutImageIndex);
+			OutImageIndex -= Frac;
+
+			SubUVTime = RelativeTime;
+		}
+	}
+	else
+	{
+		SubUVTime = 0.0f;
+	}
+
+	return float2(SubUVTime, OutImageIndex);
+}
+
+void PixelMain(
+	in FShaderInterpolants Interpolants,
+	out float2 OutRandomSubImage : SV_Target0
+	)
+{
+	// Sample the current position, velocity, and attributes for this particle.
+	const float4 PositionSample = Texture2DSample(PositionTexture, PositionTextureSampler, Interpolants.TexCoord.xy);
+	const float4 VelocitySample = Texture2DSample(VelocityTexture, VelocityTextureSampler, Interpolants.TexCoord.xy );
+	const float TimeScale = VelocitySample.w;
+
+	// Position.w holds the relative time of the particle.
+	float RelativeTime = PositionSample.w + DeltaSeconds * TimeScale;
+
+	OutRandomSubImage = ComputeRandomSubImage(Interpolants.TexCoord.xy, RelativeTime);
+}

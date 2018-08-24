@@ -1,0 +1,115 @@
+﻿INTSourceChangeList:3228962
+Availability:Public
+Title:2.Google VR プロジェクトのセットアップ
+Crumbs:%ROOT%, Platforms/GoogleVR
+Description:UE4 プロジェクトで Google VR を使うためのセットアップ方法
+Navigation:platform
+Skilllevel:Intermediate
+Version:4.12
+Parent:Platforms/GoogleVR/QuickStart
+order:2
+type:multi-step
+tags:VR
+tags:Google VR
+
+[NAV]
+
+ このセクションでは、UE4 プロジェクトで Google VR を使用するためのセットアップを行います。
+
+1. UE4 エディタをロードしたら、**メインツールバー** から **[Edit (編集)]** タブを開いて、**Plugins** メニュー アイテムを選択します。
+
+	![](GVRQS_Pligin_Menu_00.png)
+
+1. [Plugins] メニューから **[Virtual Reality]** セクションを開いて、**[Google VR]** が有効にされていることを確認します。
+
+	![](GVRQS_Pligin_GVR_Enabled_00.png)
+
+    [region:note]
+    Google VR プラグインはデフォルトで有効にされています。有効になっていない場合は、**[Enabled]** の横のチェックボックスをクリックすれば有効になります。この操作をすると変更を反映するために、UE4 エディタを再起動のプロンプトが表示されます。Google VR プラグインを有効にした後、UE4 エディタを再起動しないと、プラグインが正常に動作しません。
+    [/region]
+
+1. **コンテンツ ブラウザ** に新規マテリアルを作成し、**「MAT_Floor」** と名前を付けてダブルクリックして開きます。
+
+	![](GVRQS_Floor_Material_00.png)
+
+1. マテリアル グラフに値が **0.5** の **Constant** Material Expression ノードを追加して、その出力を **Base Color** 入力に接続し、**[Apply]** ボタンを押してマテリアルをコンパイルします。
+
+	![](GVRQS_Floor_Material_Setup_00.png)
+
+1. コンテンツ ブラウザから **Mat_Floor** マテリアルをレベルに置かれている **Floor** スタティックメッシュにドラッグして、マテリアルをスタティックメッシュに適用します。
+
+	[OBJECT:EmbeddedVideo]
+	[PARAMLITERAL:width]
+	640
+	[/PARAMLITERAL]
+	[PARAMLITERAL:height]
+	360
+	[/PARAMLITERAL]
+	[PARAMLITERAL:videoid]
+	k-1bWOSaXU8
+	[/PARAMLITERAL]
+	[/OBJECT]
+
+1. メインツールバーから **[File]** オプションを選択して **[Save (保存する)]** オプションをクリックして **[Save Level As (名前をつけて保存)]** ウィンドウを表示します。
+
+	![](GVRQS_Save_Level_00.png)
+
+1. **[Save Level As (名前を付けてレベルを保存)]** ウィンドウの **[Name]** セクションで、レベルに **「EntryLevel」** という名前を付けて **[Save (保存)]** ボタンを押します。
+
+	![](GVRQS_Save_Level_01.png)
+
+1. 再び **メイン ツールバー** で、**[Edit (編集)]** の **[Project Settings (プロジェクト設定)]** メニュー オプションを選びます。
+
+	![](GVRQS_Project_Settings_00.png)
+
+1. [Project Settings (プロジェクト設定)] メニューから **[Maps & Modes]** セクションの **[Default Maps]** セクションを開いて、**[Editor Startup Map]** と **[Game Default Map]** を EntryLevel map に変更して、プロジェクトが起動すると EntryLevel map が確実にロードされるようにします。
+
+	![](GVRQS_Select_Level_00.png)
+
+1. 再び [Project Settings (プロジェクト設定)]で、**[Target Hardware (ターゲット ハードウェア)]** セクションの **[Target Hardware]** クラスが **「Mobile / Tablet」** そしてグラフィックス レベルが **「Scalable 3D or 2D」** になっていることを確認します。 
+
+	![](GVRQS_Target_Hardware_00.png)
+
+	[region:note]
+	**[Pending Changes]** の下の **[Restart Editor]** ボタンを押してエディタを再起動し変更箇所を更新します。この操作をしないとプロジェクトで Google VR が動きません。
+	![](GVRQS_Target_Hardware_01.png)
+	[/region]
+
+1. ステレオスコピック レンダリングを正常に行うためには **[Rendering (レンダリング)]** セクションの **[Mobile HDR]** が無効になっていなければならないので、それを確認します。
+
+	![](GVRQS_Moile_HDR_Off_00.png)
+
+1. **[Input (入力)]** セクションの **[Mobile]** カテゴリで、DefaultVirtualJoysticks の横の小さな白い三角をクリックし、トップダウン リストから **[Clear]** オプションを選択して、**Default Touch Interface** から **Default Touch Interface** を削除します。
+
+	[OBJECT:EmbeddedVideo]
+	[PARAMLITERAL:width]
+	640
+	[/PARAMLITERAL]
+	[PARAMLITERAL:height]
+	360
+	[/PARAMLITERAL]
+	[PARAMLITERAL:videoid]
+	-Ylbi1TCKZs
+	[/PARAMLITERAL]
+	[/OBJECT]
+
+1. **[Platforms]** > **[Android]** セクションの **[APKPackaging]** と **[Google Play Services]** セクションの中にある **[Configure Now (今すぐ設定する)]** ボタンを押して、プロジェクトを正しくパッケージ化されるようにします。
+
+	![](GVRQS_Config_Now_00.png)
+
+1. **[APKPackaging]** セクションで **[Minimum SDK Version]** および **[Target SDK Version]** を **「21」** に変更し、**[Enable FullScreen Immersive on KitKat and above devices (KitKat と上記デバイスで FullScreen Immersive を有効にする)]** オプションをオンにして、プロジェクトを VR ヘッドセットで見ると表示されるオンスクリーン ボタンを非表示にします。
+
+	![](GVRQS_SDK_Version_00.png)
+
+1. **[Advanced APKPackaging]** セクションで **[Configure GoogleVR for sustained performance mode (GoogleVR をパフォーマンス維持モードに設定)]** オプションをオンにします。
+
+	![](GVRQS_GoogleVR_Options_00.png)
+
+	* **Sustained Performance:** デバイスをパフォーマンス維持モードにします。デバイスがオーバーヒートしてパフォーマンスが大幅に低下してしまわないレベルにパフォーマンスを割り当てます。プリケーションを長時間実行する場合はは、このオプションをオンにしておくことを推奨します。
+
+1. **[Android SDK]** セクションの **[SDKConfig]** セクションで、**[SDK API Level]** および **[NDK API Level]** をデフォルトではなく **[android-21]** にして、プロジェクトが最新の Android SDK に対して確実にコンパイルされるようにします。
+
+	![](GVRQS_Android_SDK_Options_00.png)
+
+次のセクションでは、UE4 プロジェクトをパッケージ化して、Google VR デバイスで動作するようにします。
+[NAV]

@@ -1,0 +1,865 @@
+#include "Common.usf"
+#include "FluidCommon.usf"
+#ifndef NV_SHADER_EXTN_SLOT
+#define NV_SHADER_EXTN_SLOT u7
+#endif
+#include "nvHLSLExtns.usf"
+
+#define WARP_SIZE 32
+#define LOG2_WARP_SIZE 5
+#define MAX_WARPS_PER_BLOCK 32
+
+#define HOLE_SCAN_FLAG_BIT 31
+#define HOLE_SCAN_FLAG (1U << HOLE_SCAN_FLAG_BIT)
+#define HOLE_SCAN_MASK (HOLE_SCAN_FLAG - 1)
+
+#define TYPE_BUBBLE 0
+#define TYPE_FOAM 2
+#define TYPE_SPRAY 4
+
+//[0] = TotalCount, [1] = TargetCount, [2] = HolesBeforeStart
+//RWStructuredBuffer<uint> Counts;
+
+RWStructuredBuffer<float4> PositionBuffer;
+RWStructuredBuffer<float4> VelocityBuffer;
+RWStructuredBuffer<float>  RenderAttrBuffer;
+
+Buffer<uint> LastCount;
+Buffer<uint> TargetCount;
+
+RWBuffer<uint> LastCountRW;
+RWBuffer<uint> TargetCountRW;
+
+//------------------------------------------------------------------------------
+Buffer<uint> ParticleIndices;
+Texture2D PositionTexture;
+Texture2D VelocityTexture;
+
+Texture3D LiquidSurfaceTexture;
+SamplerState LiquidSurfaceTextureSampler;
+
+Texture3D SolidBoundaryTexture;
+SamplerState SolidBoundaryTextureSampler;
+
+Texture3D GridVelocityUTexture;
+SamplerState GridVelocityUTextureSampler;
+Texture3D GridVelocityVTexture;
+SamplerState GridVelocityVTextureSampler;
+Texture3D GridVelocityWTexture;
+SamplerState GridVelocityWTextureSampler;
+
+float EvalSurfGradComp(float3 i, float3 w1, float3 w01, float3 w3, float3 w23, uniform int comp)
+{
+	const float3 TexelSize = float3(1.0f / DOMAIN_SIZE_X, 1.0f / DOMAIN_SIZE_Y, 1.0f / DOMAIN_SIZE_Z);
+
+	float3 t0 = (i - 1 + w1 / w01) * TexelSize;
+	float3 t1 = (i + 1 + w3 / w23) * TexelSize;
+
+	float s[8];
+	s[0] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t0.y, t0.z), 0);
+	s[1] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t0.y, t0.z), 0);
+	s[2] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t1.y, t0.z), 0);
+	s[3] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t1.y, t0.z), 0);
+	s[4] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t0.y, t1.z), 0);
+	s[5] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t0.y, t1.z), 0);
+	s[6] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t1.y, t1.z), 0);
+	s[7] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t1.y, t1.z), 0);
+
+	const int comp1 = (comp + 1) % 3;
+	const int comp2 = (comp + 2) % 3;
+
+	const int s0 = (1 << comp);
+	const int s1 = (1 << comp1);
+	const int s2 = (1 << comp2);
+
+	float a = lerp(s[0], s[0 + s2], w23[comp2]); //w01[comp2] = 1 - w23[comp2]
+	float b = lerp(s[0 + s1], s[0 + s1 + s2], w23[comp2]); //w01[comp2] = 1 - w23[comp2]
+	float ab = lerp(a, b, w23[comp1]); //w01[comp1] = 1 - w23[comp1]
+
+	float c = lerp(s[s0], s[s0 + s2], w23[comp2]); //w01[comp2] = 1 - w23[comp2]
+	float d = lerp(s[s0 + s1], s[s0 + s1 + s2], w23[comp2]); //w01[comp2] = 1 - w23[comp2]
+	float cd = lerp(c, d, w23[comp1]); //w01[comp1] = 1 - w23[comp1]
+
+	return (cd - ab) * w23[comp]; //w01[comp] = -w23[comp]
+}
+
+float Bilerp(float v00, float v10, float v01, float v11, float fx, float fy)
+{
+	return (1 - fy)*((1 - fx)*v00 + fx*v10) + fy*((1 - fx)*v01 + fx*v11);
+}
+
+// return the levelset value and the normal at the given location
+float3 GetSurfaceNormal(float3 VoxPos)
+{
+	float3 NodPos = VoxPos - float3(0.5f, 0.5f, 0.5f);
+	int3 ijk = int3(floor(NodPos));
+	float3 frac = NodPos - ijk;
+	float ls000 = LiquidSurfaceTexture[(ijk + int3(0, 0, 0))] - SURFACE_LEVELSET_AT;
+	float ls001 = LiquidSurfaceTexture[(ijk + int3(0, 0, 1))] - SURFACE_LEVELSET_AT;
+	float ls010 = LiquidSurfaceTexture[(ijk + int3(0, 1, 0))] - SURFACE_LEVELSET_AT;
+	float ls011 = LiquidSurfaceTexture[(ijk + int3(0, 1, 1))] - SURFACE_LEVELSET_AT;
+	float ls100 = LiquidSurfaceTexture[(ijk + int3(1, 0, 0))] - SURFACE_LEVELSET_AT;
+	float ls101 = LiquidSurfaceTexture[(ijk + int3(1, 0, 1))] - SURFACE_LEVELSET_AT;
+	float ls110 = LiquidSurfaceTexture[(ijk + int3(1, 1, 0))] - SURFACE_LEVELSET_AT;
+	float ls111 = LiquidSurfaceTexture[(ijk + int3(1, 1, 1))] - SURFACE_LEVELSET_AT;
+
+	//	float Surface =
+	//		ls000*(1 - frac.x)*(1 - frac.y)*(1 - frac.z) +
+	//		ls001*(1 - frac.x)*(1 - frac.y)*(frac.z) +
+	//		ls010*(1 - frac.x)*(frac.y)*(1 - frac.z) +
+	//		ls011*(1 - frac.x)*(frac.y)*(frac.z) +
+	//		ls100*(frac.x)*(1 - frac.y)*(1 - frac.z) +
+	//		ls101*(frac.x)*(1 - frac.y)*(frac.z) +
+	//		ls110*(frac.x)*(frac.y)*(1 - frac.z) +
+	//		ls111*(frac.x)*(frac.y)*(frac.z);
+
+	float ddx00 = ls100 - ls000;
+	float ddx01 = ls101 - ls001;
+	float ddx10 = ls110 - ls010;
+	float ddx11 = ls111 - ls011;
+	float dv_dx = Bilerp(ddx00, ddx10, ddx01, ddx11, frac.y, frac.z);
+
+	float ddy00 = ls010 - ls000;
+	float ddy01 = ls011 - ls001;
+	float ddy10 = ls110 - ls100;
+	float ddy11 = ls111 - ls101;
+	float dv_dy = Bilerp(ddy00, ddy10, ddy01, ddy11, frac.x, frac.z);
+
+	float ddz00 = ls001 - ls000;
+	float ddz01 = ls011 - ls010;
+	float ddz10 = ls101 - ls100;
+	float ddz11 = ls111 - ls110;
+	float dv_dz = Bilerp(ddz00, ddz10, ddz01, ddz11, frac.x, frac.y);
+
+	float3 N = float3(dv_dx, dv_dy, dv_dz);
+	float gradLen = length(N);
+	if (gradLen > 1e-7) N /= gradLen;
+
+	return N;
+}
+
+float3 CalcSurfaceNormal(float3 pos)
+{
+#if 0
+	// tricubic, flat at modes
+	return GetSurfaceNormal(pos);
+#else
+	// use tricubic filtering
+	pos -= 0.5f;
+	float3 i = floor(pos) + 0.5f;
+	float3 t = frac(pos);
+	float3 t2 = t*t;
+	float3 t3 = t2*t;
+
+	static const float m = 1 / 6.0;
+	float3 w0 = m * (-t3 + 3 * t2 - 3 * t + 1);
+	float3 w1 = m * (3 * t3 - 6 * t2 + 4);
+	float3 w2 = m * (-3 * t3 + 3 * t2 + 3 * t + 1);
+	float3 w3 = m * t3;
+
+	float3 dw0 = 0.5f * (-t2 + 2 * t - 1);
+	float3 dw1 = 0.5f * (3 * t2 - 4 * t);
+	float3 dw2 = 0.5f * (-3 * t2 + 2 * t + 1);
+	float3 dw3 = 0.5f * t2;
+
+	float3 w01 = w0 + w1;
+	float3 w23 = w2 + w3;
+
+	float3 dw01 = dw0 + dw1;
+	float3 dw23 = dw2 + dw3;
+
+	float3 n;
+	n.x = EvalSurfGradComp(i, float3(dw1.x, w1.yz), float3(dw01.x, w01.yz), float3(dw3.x, w3.yz), float3(dw23.x, w23.yz), 0);
+	n.y = EvalSurfGradComp(i, float3(w1.x, dw1.y, w1.z), float3(w01.x, dw01.y, w01.z), float3(w3.x, dw3.y, w3.z), float3(w23.x, dw23.y, w23.z), 1);
+	n.z = EvalSurfGradComp(i, float3(w1.xy, dw1.z), float3(w01.xy, dw01.z), float3(w3.xy, dw3.z), float3(w23.xy, dw23.z), 2);
+	return normalize(n);
+#endif
+}
+
+float CalcSurfaceDist(float3 VoxelPos)
+{
+	const float3 TexelSize = float3(1.0f / DOMAIN_SIZE_X, 1.0f / DOMAIN_SIZE_Y, 1.0f / DOMAIN_SIZE_Z);
+	float3 TexCoord = VoxelPos * TexelSize;
+	float Surface = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, TexCoord, 0).x;
+	return (Surface - SURFACE_LEVELSET_AT);
+}
+
+float3 GetVelocity(float3 VoxelPos)
+{
+	const float3 TexelSize = float3(1.0f / DOMAIN_SIZE_X, 1.0f / DOMAIN_SIZE_Y, 1.0f / DOMAIN_SIZE_Z);
+	float3 TexCoord = VoxelPos * TexelSize;
+	float3 VelOut = float3(
+		GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(TexCoord.x + 0.5f / DOMAIN_SIZE_X, TexCoord.y, TexCoord.z), 0).x,
+		GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(TexCoord.x, TexCoord.y + 0.5f / DOMAIN_SIZE_Y, TexCoord.z), 0).x,
+		GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(TexCoord.x, TexCoord.y, TexCoord.z + 0.5f / DOMAIN_SIZE_Z), 0).x);
+	return VelOut;
+}
+
+//Velocity with TriCubic filtering
+float3 CalcSmoothVelocity(float3 posIn)
+{
+	static const float m = 1 / 6.0;
+	const float3 TexelSize = float3(1.0f / DOMAIN_SIZE_X, 1.0f / DOMAIN_SIZE_Y, 1.0f / DOMAIN_SIZE_Z);
+
+	float3 posC = posIn - 0.5f; // position center
+	float3 iC = floor(posC) + 0.5f;
+	float3 fC = frac(posC);
+	float3 f2C = fC * fC;
+	float3 f3C = f2C * fC;
+
+	float3 w0C = m * (-f3C + 3 * f2C - 3 * fC + 1);
+	float3 w1C = m * (3 * f3C - 6 * f2C + 4);
+	float3 w2C = m * (-3 * f3C + 3 * f2C + 3 * fC + 1);
+	float3 w3C = m * f3C;
+
+	float3 w01C = w0C + w1C;
+	float3 w23C = w2C + w3C;
+
+	float3 t0C = (iC - 1 + w1C / w01C) * TexelSize;
+	float3 t1C = (iC + 1 + w3C / w23C) * TexelSize;
+
+	float3 posF = posIn;//position faces
+	float3 iF = floor(posF) + 0.5f;
+	float3 fF = frac(posF);
+	float3 f2F = fF * fF;
+	float3 f3F = f2F * fF;
+
+	float3 w0F = m * (-f3F + 3 * f2F - 3 * fF + 1);
+	float3 w1F = m * (3 * f3F - 6 * f2F + 4);
+	float3 w2F = m * (-3 * f3F + 3 * f2F + 3 * fF + 1);
+	float3 w3F = m * f3F;
+
+	float3 w01F = w0F + w1F;
+	float3 w23F = w2F + w3F;
+
+	float3 t0F = (iF - 1 + w1F / w01F) * TexelSize;
+	float3 t1F = (iF + 1 + w3F / w23F) * TexelSize;
+
+
+
+	float3 s[8];
+	s[0] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t0F.x, t0C.y, t0C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t0C.x, t0F.y, t0C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t0C.x, t0C.y, t0F.z), 0).x);
+	s[1] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t1F.x, t0C.y, t0C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t1C.x, t0F.y, t0C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t1C.x, t0C.y, t0F.z), 0).x);
+	s[2] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t0F.x, t1C.y, t0C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t0C.x, t1F.y, t0C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t0C.x, t1C.y, t0F.z), 0).x);
+	s[3] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t1F.x, t1C.y, t0C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t1C.x, t1F.y, t0C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t1C.x, t1C.y, t0F.z), 0).x);
+	s[4] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t0F.x, t0C.y, t1C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t0C.x, t0F.y, t1C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t0C.x, t0C.y, t1F.z), 0).x);
+	s[5] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t1F.x, t0C.y, t1C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t1C.x, t0F.y, t1C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t1C.x, t0C.y, t1F.z), 0).x);
+	s[6] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t0F.x, t1C.y, t1C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t0C.x, t1F.y, t1C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t0C.x, t1C.y, t1F.z), 0).x);
+	s[7] = float3(GridVelocityUTexture.SampleLevel(GridVelocityUTextureSampler, float3(t1F.x, t1C.y, t1C.z), 0).x, GridVelocityVTexture.SampleLevel(GridVelocityVTextureSampler, float3(t1C.x, t1F.y, t1C.z), 0).x, GridVelocityWTexture.SampleLevel(GridVelocityWTextureSampler, float3(t1C.x, t1C.y, t1F.z), 0).x);
+
+	float3 a = lerp(s[0], s[1], float3(w23F.x, w23C.x, w23C.x)); //w01.x = 1 - w23.x
+	float3 b = lerp(s[2], s[3], float3(w23F.x, w23C.x, w23C.x)); //w01.x = 1 - w23.x
+	float3 ab = lerp(a, b, float3(w23C.y, w23F.y, w23C.y)); //w01.y = 1 - w23.y
+
+	float3 c = lerp(s[4], s[5], float3(w23F.x, w23C.x, w23C.x)); //w01.x = 1 - w23.x
+	float3 d = lerp(s[6], s[7], float3(w23F.x, w23C.x, w23C.x)); //w01.x = 1 - w23.x
+	float3 cd = lerp(c, d, float3(w23C.y, w23F.y, w23C.y)); //w01.y = 1 - w23.y
+
+	return lerp(ab, cd, float3(w23C.z, w23C.z, w23F.z)); //w01.z = 1 - w23.z
+}
+
+float CalcSolidDist(float3 VoxelPos)
+{
+	const float3 TexelSize = float3(1.0f / DOMAIN_SIZE_X, 1.0f / DOMAIN_SIZE_Y, 1.0f / DOMAIN_SIZE_Z);
+	float3 TexCoord = (VoxelPos + 0.5f) * TexelSize; //0.5 cause texture stores values at voxel corners!
+	float Value = SolidBoundaryTexture.SampleLevel(SolidBoundaryTextureSampler, TexCoord, 0).x;
+	return Value;
+}
+
+int IsOutsideSolid(float3 VoxelPos)
+{
+	return CalcSolidDist(VoxelPos) > 0;
+}
+
+uint IsInsideSolid(float3 VoxelPos)
+{
+	return CalcSolidDist(VoxelPos) <= 0;
+}
+
+//------------------------------------------------------------------------------
+// Scan (NV only)
+//------------------------------------------------------------------------------
+Buffer<uint> ScanIn;
+RWBuffer<uint> ScanOut;
+RWBuffer<uint> ScanTemp;
+
+
+uint scanWarp(const uint lane, uint value)
+{
+	[unroll]
+	for (uint i = 1; i < WARP_SIZE; i *= 2)
+	{
+		uint n = NvShflUp(value, i);
+		if (lane >= i) value += n;
+	}
+	return value;
+}
+
+uint reduceWarp(uint value)
+{
+	value += NvShflXor(value, 0x10);
+	value += NvShflXor(value, 0x08);
+	value += NvShflXor(value, 0x04);
+	value += NvShflXor(value, 0x02);
+	value += NvShflXor(value, 0x01);
+	return value;
+}
+
+[numthreads(DPARTICLES_SCAN_WG_SIZE, 1, 1)]
+void ScanPhase1Kernel(uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+	const uint WarpsPerBlock = DPARTICLES_SCAN_WG_SIZE >> LOG2_WARP_SIZE;
+
+	const uint count = LastCount[0];
+	const uint gridDim = DiffuseParticles.DispatchGridDim;
+	const uint blockIdx = groupIdx.x;
+	const uint idx = localIdx.x;
+	const uint lane = idx & (WARP_SIZE - 1);
+	const uint warpIdx = idx >> LOG2_WARP_SIZE;
+
+
+	const unsigned int DataWarpsPerGrid = ((count + WARP_SIZE - 1) >> LOG2_WARP_SIZE);
+	const unsigned int DataWarpsPerBlock = (DataWarpsPerGrid + gridDim.x - 1) / gridDim.x;
+	const unsigned int DataCountPerBlock = (DataWarpsPerBlock << LOG2_WARP_SIZE);
+	const unsigned int WarpBorder = DataWarpsPerBlock % WarpsPerBlock;
+	const unsigned int WarpFactor = DataWarpsPerBlock / WarpsPerBlock;
+	const unsigned int blockBeg = blockIdx.x * DataCountPerBlock;
+	const unsigned int blockEnd = min(blockBeg + DataCountPerBlock, count);
+	const unsigned int WarpSelect = (warpIdx < WarpBorder) ? 1 : 0;
+	const unsigned int WarpCount = WarpFactor + WarpSelect;
+	const unsigned int WarpOffset = warpIdx * WarpCount + WarpBorder * (1 - WarpSelect);
+	const unsigned int warpBeg = blockBeg + (WarpOffset << LOG2_WARP_SIZE);
+	const unsigned int warpEnd = min(warpBeg + (WarpCount << LOG2_WARP_SIZE), blockEnd);
+
+
+	uint sum = 0;
+	if (warpBeg < warpEnd)
+	{
+		//accum
+		for (unsigned int pos = warpBeg + lane; pos < warpEnd; pos += WARP_SIZE)
+		{
+			sum += ScanIn[pos];
+		}
+		//reduce warp
+		sum = reduceWarp(sum);
+	}
+	if (lane == 0)
+	{
+		ScanTemp[blockIdx.x * WarpsPerBlock + warpIdx] = sum;
+	}
+}
+
+//------------------------------------------------------------------------------
+groupshared uint sScanForWarp[MAX_WARPS_PER_BLOCK];
+groupshared uint sScanTotal;
+
+uint4 scan4(const uint idx, const uint warpIdx, const uint idxInWarp, const uint scanCount, const uint4 idata)
+{
+	const uint scanWarps = (scanCount + WARP_SIZE - 1) >> LOG2_WARP_SIZE;
+
+	uint4 val4 = idata;
+	uint res = 0;
+	uint sum[3];
+
+	if (warpIdx < scanWarps)
+	{
+		sum[0] = val4.x;
+		sum[1] = val4.y + sum[0];
+		sum[2] = val4.z + sum[1];
+
+		uint val = val4.w + sum[2];
+		res = scanWarp(idxInWarp, val);
+
+		if (idxInWarp == WARP_SIZE - 1)
+		{
+			sScanForWarp[warpIdx] = res;
+		}
+		res -= val; // make scan exclusive
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// 1 warp scan
+	if (idx < WARP_SIZE)
+	{
+		uint warpScanVal = (idx < scanWarps) ? sScanForWarp[idx] : 0;
+		uint warpScanRes = scanWarp(idx, warpScanVal);
+
+		if (idx == WARP_SIZE - 1)
+		{
+			sScanTotal = warpScanRes;
+		}
+
+		warpScanRes -= warpScanVal; // make scan exclusive
+		sScanForWarp[idx] = warpScanRes;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (warpIdx < scanWarps)
+	{
+		res += sScanForWarp[warpIdx];
+		val4.x = res;
+		val4.y = res + sum[0];
+		val4.z = res + sum[1];
+		val4.w = res + sum[2];
+	}
+
+	return val4;
+}
+
+[numthreads(DPARTICLES_SCAN_WG_SIZE, 1, 1)]
+void ScanPhase2Kernel(uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+	const uint WarpsPerBlock = (DPARTICLES_SCAN_WG_SIZE >> LOG2_WARP_SIZE);
+	const uint count = LastCount[0];
+	const uint gridDim = DiffuseParticles.DispatchGridDim;
+
+	const uint idx = localIdx.x;
+	const uint warpIdx = (idx >> LOG2_WARP_SIZE);
+	const uint lane = idx & (WARP_SIZE - 1);
+
+	const uint ScanCount = ((gridDim * WarpsPerBlock) >> 2);
+
+	uint offset = idx << 2;
+	uint4 val = (idx < ScanCount) ? uint4(ScanTemp[offset], ScanTemp[offset + 1], ScanTemp[offset + 2], ScanTemp[offset + 3]) : uint4(0, 0, 0, 0);
+
+	val = scan4(idx, warpIdx, lane, ScanCount, val);
+
+	if (idx < ScanCount)
+	{
+		ScanTemp[offset + 0] = min(val.x, count);
+		ScanTemp[offset + 1] = min(val.y, count);
+		ScanTemp[offset + 2] = min(val.z, count);
+		ScanTemp[offset + 3] = min(val.w, count);
+	}
+	if (idx == 0)
+	{
+		TargetCountRW[0] = count - sScanTotal;
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+[numthreads(DPARTICLES_SCAN_WG_SIZE, 1, 1)]
+void ScanPhase3Kernel(uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+	const uint WarpsPerBlock = DPARTICLES_SCAN_WG_SIZE >> LOG2_WARP_SIZE;
+
+	const uint count = LastCount[0];
+	const uint gridDim = DiffuseParticles.DispatchGridDim;
+	const uint blockIdx = groupIdx.x;
+	const uint idx = localIdx.x;
+	const uint lane = idx & (WARP_SIZE - 1);
+	const uint warpIdx = idx >> LOG2_WARP_SIZE;
+
+
+	const unsigned int DataWarpsPerGrid = ((count + WARP_SIZE - 1) >> LOG2_WARP_SIZE);
+	const unsigned int DataWarpsPerBlock = (DataWarpsPerGrid + gridDim.x - 1) / gridDim.x;
+	const unsigned int DataCountPerBlock = (DataWarpsPerBlock << LOG2_WARP_SIZE);
+	const unsigned int WarpBorder = DataWarpsPerBlock % WarpsPerBlock;
+	const unsigned int WarpFactor = DataWarpsPerBlock / WarpsPerBlock;
+	const unsigned int blockBeg = blockIdx.x * DataCountPerBlock;
+	const unsigned int blockEnd = min(blockBeg + DataCountPerBlock, count);
+	const unsigned int WarpSelect = (warpIdx < WarpBorder) ? 1 : 0;
+	const unsigned int WarpCount = WarpFactor + WarpSelect;
+	const unsigned int WarpOffset = warpIdx * WarpCount + WarpBorder * (1 - WarpSelect);
+	const unsigned int warpBeg = blockBeg + (WarpOffset << LOG2_WARP_SIZE);
+	const unsigned int warpEnd = min(warpBeg + (WarpCount << LOG2_WARP_SIZE), blockEnd);
+
+	if (warpBeg < warpEnd)
+	{
+		unsigned int scanOffset = ScanTemp[blockIdx.x * WarpsPerBlock + warpIdx];
+
+		for (uint warpPos = warpBeg; warpPos < warpEnd; warpPos += WARP_SIZE)
+		{
+			uint pos = warpPos + lane;
+			uint input = (pos < warpEnd) ? ScanIn[pos] : 0;
+
+			//input is 0 or 1, so use bit warp scan
+			uint bits = NvBallot(input);
+			//inclusive scan
+			uint scanValue = countbits(bits & (0xFFFFFFFFu >> (31 - lane)));
+
+			if (pos < warpEnd) ScanOut[pos] = (scanOffset + scanValue) | (input << HOLE_SCAN_FLAG_BIT);
+
+			scanOffset += countbits(bits);
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
+// Compact
+//------------------------------------------------------------------------------
+Buffer<uint> CompactIn;
+RWBuffer<uint> CompactOut;
+
+
+uint fetchHoleScan(uint index, out uint flag)
+{
+	const uint holeScan = CompactIn[index];
+	flag = (holeScan >> HOLE_SCAN_FLAG_BIT);
+	return (holeScan & HOLE_SCAN_MASK); //inclusive
+}
+uint fetchOutputScan(uint index, uint start, uint holesBeforeStart, out uint flag)
+{
+	uint holeScan = fetchHoleScan(index, flag);
+	if (index < start)
+	{
+		return holeScan; //inclusive
+	}
+	else
+	{
+		flag ^= 1;
+		const uint nonHoleScan = (index + 1) - holeScan; //inclusive
+		const uint nonHolesBeforeStart = start - holesBeforeStart;
+		return /*holesBeforeStart + */(nonHoleScan - nonHolesBeforeStart); //inclusive
+	}
+}
+
+groupshared uint sHolesBeforeStart;
+
+
+[numthreads(DPARTICLES_COMPACT_WG_SIZE, 1, 1)]
+void CompactKernel(uint3 globalIdx : SV_DispatchThreadID, uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+	const uint count = LastCount[0];
+	const uint start = TargetCount[0];
+	const uint gridDim = DiffuseParticles.DispatchGridDim;
+
+	if (localIdx.x == 0)
+	{
+		uint flag;
+		sHolesBeforeStart = (start > 0) ? fetchHoleScan(start - 1, flag) : 0;
+
+		//if (globalIdx.x == 0)
+		//{
+		//	Counts[2] = sHolesBeforeStart;
+		//}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	for (uint inputPos = start + globalIdx.x; inputPos < count; inputPos += DPARTICLES_COMPACT_WG_SIZE * gridDim.x)
+	{
+		uint flag;
+		uint outputPos = fetchOutputScan(inputPos, start, sHolesBeforeStart, flag);
+
+		if (flag)
+		{
+			outputPos -= 1; //inclusive -> exclusive
+
+			CompactOut[outputPos] = inputPos;
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
+// Simulate
+//------------------------------------------------------------------------------
+RWBuffer<uint> HoleScanSum;
+Buffer<uint> MoveIndices;
+
+float EvalParticleType(in out float3 Position)
+{
+	float3 PositionInVoxel = WorldToVoxel(Position);
+	float FluidDist = CalcSurfaceDist(PositionInVoxel);
+
+	if (FluidDist > DiffuseParticles.FoamSurfaceDistThreshold)
+	{
+		return TYPE_SPRAY;
+	}
+	if (FluidDist < -DiffuseParticles.FoamSurfaceDistThreshold)
+	{
+		return TYPE_BUBBLE;
+	}
+
+	//project to the fluid surface
+	float3 Normal = CalcSurfaceNormal(PositionInVoxel);
+	FluidDist -= 0.1f; //offset
+	PositionInVoxel -= Normal * FluidDist;
+	Position = VoxelToWorld(PositionInVoxel);
+
+	return TYPE_FOAM;
+}
+
+[numthreads(DPARTICLES_SIMULATE_WG_SIZE, 1, 1)]
+void SimulateKernel(uint3 globalIdx : SV_DispatchThreadID, uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+	const uint count = TargetCount[0];
+	const uint gridDim = DiffuseParticles.DispatchGridDim;
+
+	for (uint dstIdx = globalIdx.x; dstIdx < count; dstIdx += DPARTICLES_SIMULATE_WG_SIZE * gridDim.x)
+	{
+		uint srcIdx = dstIdx;
+
+		uint holeScanSum = HoleScanSum[dstIdx];
+		if ((holeScanSum & HOLE_SCAN_FLAG) != 0)
+		{
+			// we have a hole
+			holeScanSum &= HOLE_SCAN_MASK; //remove hole flag
+			holeScanSum -= 1; //inclusive -> exclusive
+
+			srcIdx = MoveIndices[holeScanSum];
+		}
+
+		float4 Position = PositionBuffer[srcIdx];
+		float4 Velocity = VelocityBuffer[srcIdx];
+
+		const float3 PositionInVoxel = WorldToVoxel(Position.xyz);
+		float3 FluidVelocity = GetVelocity(PositionInVoxel) * 100.0f; //CalcSmoothVelocity(PositionInVoxel) * 100.0f; //from m/sec to cm/sec //
+
+		uint ParticleType = uint(Position.w) & ~1;
+		float IE = Position.w - ParticleType;
+
+		if (ParticleType == TYPE_SPRAY)
+		{
+			Velocity.z -= DiffuseParticles.DeltaSeconds * 9.8f * 100; //apply gravity
+		}
+		else if (ParticleType == TYPE_BUBBLE)
+		{
+			Velocity.xyz = lerp(Velocity.xyz, FluidVelocity, DiffuseParticles.BubbleDrag);
+			Velocity.z += DiffuseParticles.DeltaSeconds * 9.8f * 100 * DiffuseParticles.BubbleBuoyancy;
+		}
+		else
+		{
+			Velocity.xyz = FluidVelocity;
+		}
+		if (Velocity.w < DiffuseParticles.FadeinTime || ParticleType == TYPE_FOAM)
+		{
+			Velocity.w += DiffuseParticles.DeltaSeconds;
+		}
+		float I = smoothstep(0, DiffuseParticles.FadeinTime, Velocity.w);
+
+		const float FadeoutStart = DiffuseParticles.FadeinTime + lerp(DiffuseParticles.LifetimeMin, DiffuseParticles.LifetimeMax, IE);
+		I *= smoothstep(-DiffuseParticles.FadeoutTime, 0, FadeoutStart - Velocity.w);
+
+		Position.xyz += DiffuseParticles.DeltaSeconds * Velocity.xyz;
+		Position.w = EvalParticleType(Position.xyz) + IE;
+
+		PositionBuffer[dstIdx] = Position;
+		VelocityBuffer[dstIdx] = Velocity;
+		RenderAttrBuffer[dstIdx] = I;
+
+		const float LifeEnd = FadeoutStart + DiffuseParticles.FadeoutTime;
+		uint IsDeadParticle = ((Velocity.w >= LifeEnd) ? 1 : 0) | /*IsInsideSolid(PositionInVoxel) |*/ any(uint3(PositionInVoxel < 0.0f)) | any(uint3(PositionInVoxel > float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z)));
+		HoleScanSum[dstIdx] = IsDeadParticle;
+	}
+}
+
+//------------------------------------------------------------------------------
+// Append
+//------------------------------------------------------------------------------
+
+void IterateSamples(float3 VoxelPosition0, float3 Position0, float3 Velocity0, float3 Normal0, out float TrappedAir, out float WaveCrest)
+{
+	TrappedAir = 0.0f;
+	WaveCrest = 0.0f;
+	[unroll(NUM_FOAM_SAMPLES)]
+	for (uint n = 0; n < NUM_FOAM_SAMPLES; ++n)
+	{
+		float4 Sample = DiffuseParticles.Samples[n];
+		Sample.xyz *= DiffuseParticles.GenerateRadius;
+		float3 VoxelPosition = VoxelPosition0 + Sample.xyz;
+
+		int bOutsideSolid = IsOutsideSolid(VoxelPosition);
+		int bInsideFluid = (CalcSurfaceDist(VoxelPosition) <= 0);
+		[branch]
+		if (all(int2(bOutsideSolid, bInsideFluid)))
+		{
+			const float W = Sample.w;
+			float3 Position = Position0 + Sample.xyz * DomainVoxelInfo.VoxelWidth;
+			float3 Normal = CalcSurfaceNormal(VoxelPosition);
+			float3 Velocity = GetVelocity(VoxelPosition);
+
+			float3 PositionDiff = (Position0 - Position);
+			float3 VelocityDiff = (Velocity0 - Velocity);
+
+			float PositionDiffN = normalize(PositionDiff);
+			float VelocityDiffN = normalize(VelocityDiff);
+
+			TrappedAir += length(VelocityDiff) * (1 - dot(PositionDiffN, VelocityDiffN)) * W;
+			WaveCrest += step(0, dot(PositionDiffN, Normal)) * (1 - dot(Normal, Normal0)) * W;
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
+RWBuffer<uint> AppendIndices;
+
+#if 0
+[numthreads(DPARTICLES_APPEND_WG_SIZE, 1, 1)]
+void AppendKernel(uint3 globalIdx : SV_DispatchThreadID, uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+	if (globalIdx.x < 100)
+	{
+		uint index;
+		InterlockedAdd(TargetCountRW[0], 1, index);
+		if (index < DiffuseParticles.MaxParticlesCount)
+		{
+			PositionBuffer[index] = float4(0, 0, 500, 0);
+			VelocityBuffer[index] = float4((float(globalIdx.x)/500 - 1)*100, 0, 1000, 3);
+			AppendIndices[index] = 0;
+		}
+	}
+}
+#endif
+
+
+///p,q -> p^q = n (n - must be normalized!)
+void buildPlaneBasis(in float3 n, out float3 p, out float3 q)
+{
+	const float SQRT1_2 = sqrt(0.5f);
+	[branch]
+	if (abs(n.z) > SQRT1_2)
+	{
+		// choose p in y-z plane
+		float k = sqrt(n.y * n.y + n.z * n.z);
+		p.x = 0;
+		p.y = -n.z / k;
+		p.z = n.y / k;
+		// set q = n x p
+		q.x = k;
+		q.y = -n.x * p.z;
+		q.z = n.x * p.y;
+	}
+	else
+	{
+		// choose p in x-y plane
+		float k = sqrt(n.x * n.x + n.y * n.y);
+		p.x = -n.y / k;
+		p.y = n.x / k;
+		p.z = 0;
+		// set q = n x p
+		q.x = -n.z * p.y;
+		q.y = n.z * p.x;
+		q.z = k;
+	}
+}
+
+//code from http://www.reedbeta.com/blog/2013/01/12/quick-and-easy-gpu-random-numbers-in-d3d11/
+uint wang_hash(uint seed)
+{
+	seed = (seed ^ 61) ^ (seed >> 16);
+	seed *= 9;
+	seed = seed ^ (seed >> 4);
+	seed *= 0x27d4eb2d;
+	seed = seed ^ (seed >> 15);
+	return seed;
+}
+
+void rand_xorshift(in out uint state)
+{
+	// Xorshift algorithm from George Marsaglia's paper
+	state ^= (state << 13);
+	state ^= (state >> 17);
+	state ^= (state << 5);
+}
+
+// Generate a random float in [0, 1)...
+float rand_float(in out uint state)
+{
+	rand_xorshift(state);
+	return float(state) * (1.0 / 4294967296.0);
+}
+
+[numthreads(DPARTICLES_APPEND_WG_SIZE, 1, 1)]
+void AppendKernel(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex < DiffuseParticles.FluidParticleCount)
+	{
+		// Read in the particle index and its position.
+		uint ParticleIndex = ParticleIndices[InputIndex];
+		int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+
+		const float4 ParticlePosition = PositionTexture.Load(ParticleTexel);
+		// Only the live particles are needed
+		if (ParticlePosition.w <= 2.f)
+		{
+			const float3 PositionInVoxel = WorldToVoxel(ParticlePosition.xyz);
+
+			// Use particles only near the surface.
+			float DistanceInVoxel = CalcSurfaceDist(PositionInVoxel);
+
+			if (abs(DistanceInVoxel) <= DiffuseParticles.GenerateSurfaceDistThreshold)
+			{
+				float3 Velocity0 = GetVelocity(PositionInVoxel);
+
+
+				float3 Normal = CalcSurfaceNormal(PositionInVoxel);
+
+				float TrappedAir, WaveCrest;
+				IterateSamples(PositionInVoxel, ParticlePosition.xyz, Velocity0, Normal, TrappedAir, WaveCrest);
+
+				WaveCrest *= step(0.6, dot(Normal, normalize(Velocity0)));
+
+				float Ita = saturate(TrappedAir * DiffuseParticles.TrappedAirScale + DiffuseParticles.TrappedAirBias);
+				float Iwc = saturate(WaveCrest * DiffuseParticles.WaveCrestScale + DiffuseParticles.WaveCrestBias);
+
+				float Energy = 0.5f * dot(Velocity0.xyz, Velocity0.xyz);
+				float IE = saturate(Energy * DiffuseParticles.EnergyScale + DiffuseParticles.EnergyBias);
+
+				float SampleCount = DiffuseParticles.DeltaSeconds * IE * (Ita * DiffuseParticles.TrappedAirSamples + Iwc * DiffuseParticles.WaveCrestSamples);
+
+				float4 ParticleVelocity = VelocityTexture.Load(ParticleTexel); //units = cm/sec
+				//ParticleVelocity.xyz *= 0.01f; //convert cm/sec to m/sec
+
+				float3 ev = normalize(ParticleVelocity.xyz);
+				float3 e1, e2;
+				buildPlaneBasis(ev, e1, e2);
+
+				float v = dot(ev, ParticleVelocity.xyz);
+
+				uint rand_state = wang_hash(InputIndex);
+				for (uint i = 0; i < uint(SampleCount); ++i)
+				{
+					uint index;
+					InterlockedAdd(TargetCountRW[0], 1, index);
+					if (index < DiffuseParticles.MaxParticlesCount)
+					{
+						float3 randVector;
+						sincos(2 * PI * rand_float(rand_state), randVector.y, randVector.x);
+						randVector.xy *= sqrt(rand_float(rand_state)) * DomainVoxelInfo.VoxelWidth;
+						randVector.z = rand_float(rand_state) * DiffuseParticles.DeltaSeconds * v;
+
+						float3 NewPosition = ParticlePosition.xyz;
+						NewPosition += e1 * randVector.x;
+						NewPosition += e2 * randVector.y;
+						NewPosition += ev * randVector.z;
+
+						float3 NewVelocity = ParticleVelocity.xyz;
+						NewVelocity += e1 * (randVector.x * v * DiffuseParticles.SideVelocityScale);
+						NewVelocity += e2 * (randVector.y * v * DiffuseParticles.SideVelocityScale);
+
+						float ParticleType = EvalParticleType(NewPosition);
+						PositionBuffer[index] = float4(NewPosition, ParticleType + IE);
+						VelocityBuffer[index] = float4(NewVelocity, 0.0f);
+						RenderAttrBuffer[index] = 0.0f;
+						AppendIndices[index] = 0;
+					}
+				}
+			}
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
+// Finalize
+//------------------------------------------------------------------------------
+RWBuffer<uint> DrawArgs;
+
+[numthreads(32, 1, 1)]
+void FinalizeKernel(uint3 localIdx : SV_GroupThreadID)
+{
+	if (localIdx.x == 0)
+	{
+		uint ParticleCount = min(TargetCount[0], DiffuseParticles.MaxParticlesCount);
+		LastCountRW[0] = ParticleCount;
+
+		// VertexCountPerInstance
+		DrawArgs[0] = 1;
+		// InstanceCount
+		DrawArgs[1] = ParticleCount;
+		// StartVertexLocation
+		DrawArgs[2] = 0;
+		// StartInstanceLocation
+		DrawArgs[3] = 0;
+	}
+}

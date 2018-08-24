@@ -1,0 +1,85 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidRepairLevelset.usf:
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+#if INPUT_IS_UINT
+Texture3D<uint> InLevelset;
+#else
+Texture3D<float> InLevelset;
+#endif
+
+#if OUTPUT_IS_UINT
+RWTexture3D<uint> OutLevelset;
+#else
+RWTexture3D<float> OutLevelset;
+#endif
+
+float GetLevelset(int3 ijk)
+{
+#if INPUT_IS_UINT
+	return -asfloat(InLevelset[ijk]);
+#else
+	return InLevelset[ijk];
+#endif
+}
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void RepairLevelset( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint3 ijk =
+#if GRID_IS_LEVELSET
+		GetActiveIndexLS(DispatchThreadId);
+#else
+		GetActiveIndex(DispatchThreadId);
+#endif
+	// if the input is 0, then we will assume it was not splatted into.
+	float ls = GetLevelset(ijk);
+
+#if 1 // bypass
+#define SQRT_OF_2 1.4142
+	if (!ls)
+	{
+		ls = min(ls, GetLevelset(ijk + int3(-1, -1, -1)) + SQRT_OF_3);
+		ls = min(ls, GetLevelset(ijk + int3(-1, -1,  0)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3(-1, -1,  1)) + SQRT_OF_3);
+		ls = min(ls, GetLevelset(ijk + int3(-1,  0, -1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3(-1,  0,  0)) + 1.0f);
+		ls = min(ls, GetLevelset(ijk + int3(-1,  0,  1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3(-1,  1, -1)) + SQRT_OF_3);
+		ls = min(ls, GetLevelset(ijk + int3(-1,  1,  0)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3(-1,  1,  1)) + SQRT_OF_3);
+		
+		ls = min(ls, GetLevelset(ijk + int3( 0, -1, -1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 0, -1,  0)) + 1.0f);
+		ls = min(ls, GetLevelset(ijk + int3( 0, -1,  1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 0,  0, -1)) + 1.0f);
+//		ls = min(ls, GetLevelset(ijk + int3( 0,  0,  0)) + 1.0f);
+		ls = min(ls, GetLevelset(ijk + int3( 0,  0,  1)) + 1.0f);
+		ls = min(ls, GetLevelset(ijk + int3( 0,  1, -1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 0,  1,  0)) + 1.0f);
+		ls = min(ls, GetLevelset(ijk + int3( 0,  1,  1)) + SQRT_OF_2);
+
+		ls = min(ls, GetLevelset(ijk + int3( 1, -1, -1)) + SQRT_OF_3);
+		ls = min(ls, GetLevelset(ijk + int3( 1, -1,  0)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 1, -1,  1)) + SQRT_OF_3);
+		ls = min(ls, GetLevelset(ijk + int3( 1,  0, -1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 1,  0,  0)) + 1.0f);
+		ls = min(ls, GetLevelset(ijk + int3( 1,  0,  1)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 1,  1, -1)) + SQRT_OF_3);
+		ls = min(ls, GetLevelset(ijk + int3( 1,  1,  0)) + SQRT_OF_2);
+		ls = min(ls, GetLevelset(ijk + int3( 1,  1,  1)) + SQRT_OF_3);
+	}
+#endif // bypass
+
+#if OUTPUT_IS_UINT
+	ls = max(0, -ls);
+	OutLevelset[ijk] = asuint(ls);
+#else
+	OutLevelset[ijk] = ls;
+#endif
+}

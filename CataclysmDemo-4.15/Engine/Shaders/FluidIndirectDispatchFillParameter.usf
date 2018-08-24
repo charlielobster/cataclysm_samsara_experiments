@@ -1,0 +1,21 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidIndirectDispatchFillParameter.usf
+==============================================================================*/
+
+#include "Common.usf"
+
+Buffer<uint> InCount;
+
+RWBuffer<uint> OutParameters;
+
+float GroupMultiplier;
+
+[numthreads(1, 1, 1)]
+void IndirectDispatchFillParameter()
+{
+	OutParameters[0] = max(1, (InCount[0] + GROUP_COUNT - 1) / GROUP_COUNT) * GroupMultiplier;
+	OutParameters[1] = 1 * GroupMultiplier;
+	OutParameters[2] = 1 * GroupMultiplier;
+}

@@ -1,0 +1,47 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidGenerateTexCoords.usf:
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommonDefines.usf"
+
+/** Textures containing particle inromation. */
+// position is 32 bits per component
+Texture2D PositionTexture;
+Texture2D VelocityTexture;
+
+/** Input buffer containing particle indices. */
+Buffer<uint> InParticleIndices;
+Buffer<uint> InExtraIndices;
+
+RWTexture2D<float2> OutTexCoord0;
+RWTexture2D<float2> OutTexCoord1;
+
+
+// GPU particles are arranged as Linear at texture
+[numthreads(CREATE_BRICK_MAP_THREADS_COUNT, 1, 1)]
+void GenerateTexCoords(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Buffer offsets.
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex < GenerateTexCoords.ParticleCount)
+	{
+		// Read in the particle index and its position.
+		uint ParticleIndex = InputIndex < GenerateTexCoords.ExtraParticleCount ? InExtraIndices[InputIndex] : InParticleIndices[InputIndex - GenerateTexCoords.ExtraParticleCount];
+		int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+
+		const float4 ParticlePosition = PositionTexture.Load(ParticleTexel);
+		const float4 ParticleVelocity = VelocityTexture.Load(ParticleTexel);
+		// TODO Regenerate based on the plane of the surface normal?  That is... get the velocity tangent to the surface, and project it onto a flat plane to use that 2d distance change.
+		if (GenerateTexCoords.bRegenerate0 || ParticleVelocity.w < 0)
+		{
+			OutTexCoord0[ParticleTexel.xy] = (ParticlePosition.xyz - GenerateTexCoords.ElapsedSeconds0 * ParticleVelocity.xyz).xz;
+		}
+		if (GenerateTexCoords.bRegenerate1 || ParticleVelocity.w < 0)
+		{
+			OutTexCoord1[ParticleTexel.xy] = (ParticlePosition.xyz - GenerateTexCoords.ElapsedSeconds1 * ParticleVelocity.xyz).xz;
+		}
+	}
+}

@@ -1,0 +1,57 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidVelAtPos
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<uint> ParticleIndices;
+StructuredBuffer<uint> ExtraParticleIndices;
+
+Texture2D PositionTexture;
+
+SamplerState InUSampler;
+Texture3D InU;
+SamplerState InVSampler;
+Texture3D InV;
+SamplerState InWSampler;
+Texture3D InW;
+SamplerState LiquidBoundarySampler;
+Texture3D LiquidBoundary;
+
+RWTexture2D<float4> OutVelAtPos;
+
+[numthreads(GENERATE_PARTICLES_GRID_THREAD_COUNT, 1, 1)]
+void VelAtPos(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex < ParticleCount.ParticleCount)
+	{
+
+		uint ParticleIndex = InputIndex < ParticleCount.ExtraParticleCount ? ExtraParticleIndices[InputIndex] : ParticleIndices[InputIndex - ParticleCount.ExtraParticleCount];
+		int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+
+		const float4 WorldPosition = PositionTexture.Load(ParticleTexel);
+		const float3 PositionInVoxel = WorldToVoxel(WorldPosition.xyz);
+		const float3 TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+
+		// Find out if the particle is in the bulk of the liquid
+		const float Surface = Texture3DSample(LiquidBoundary, LiquidBoundarySampler, TexCoord) - SURFACE_LEVELSET_AT;
+		bool isInLiquid = Surface < 0; // This should match the isInLiquid check in Particle Position update shader.
+		float U = 0;
+		float V = 0;
+		float W = 0;
+		if (isInLiquid)
+		{
+			// staggered velocity samples are on left, bottom and back faces, not center.
+			U = Texture3DSample(InU, InUSampler, float3(TexCoord.x + 0.5f / DOMAIN_SIZE_X, TexCoord.y, TexCoord.z));
+			V = Texture3DSample(InV, InVSampler, float3(TexCoord.x, TexCoord.y + 0.5f / DOMAIN_SIZE_Y, TexCoord.z));
+			W = Texture3DSample(InW, InWSampler, float3(TexCoord.x, TexCoord.y, TexCoord.z + 0.5f / DOMAIN_SIZE_Z));
+		}
+
+		OutVelAtPos[ParticleTexel.xy] = float4(U, V, W, Surface);
+	}
+}

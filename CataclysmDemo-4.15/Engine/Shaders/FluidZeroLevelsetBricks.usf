@@ -1,0 +1,26 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidZeroBricks.usf: Shader to zero out bricks
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+RWTexture3D<float> OutFloat0;
+RWTexture3D<uint> OutUint0;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void ZeroLevelsetBricks( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint brickIdx = ActiveBricksList[DispatchThreadId.x >> LS_BRICK_SIZE_BITS_X];
+#if ZERO_UNMAPPED_ONLY
+	if (!(brickIdx & 0x80000000)) return;
+#else
+	if (brickIdx & 0x80000000) return;
+#endif
+	uint3 ijk = GetActiveIndexLS(DispatchThreadId);
+
+	OutFloat0[ijk] = 0;
+	OutUint0[ijk] = 0;
+}

@@ -1,0 +1,148 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidRedistanceLevelset.usf:
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+#define CRUDE_SCHEME 0
+#define GODUNOVS_SCHEME 1
+#define ENGQUIST_OSHER_SCHEME 2
+
+#if INPUT_IS_UINT
+Texture3D<uint> InLevelset;
+#else
+Texture3D<float> InLevelset;
+#endif
+
+#if OUTPUT_IS_UINT
+RWTexture3D<uint> OutLevelset;
+#else
+RWTexture3D<float> OutLevelset;
+#endif
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void RedistanceLevelset( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint3 ijk =
+#if GRID_IS_LEVELSET
+		GetActiveIndexLS(DispatchThreadId);
+#else
+		GetActiveIndex(DispatchThreadId);
+#endif
+
+#if INPUT_IS_UINT
+	float ls = -asfloat(InLevelset[ijk]);
+	float ls100 = -asfloat(InLevelset[ijk + int3(1, 0, 0)]);
+	float ls010 = -asfloat(InLevelset[ijk + int3(0, 1, 0)]);
+	float ls001 = -asfloat(InLevelset[ijk + int3(0, 0, 1)]);
+	float lsm100 = -asfloat(InLevelset[ijk + int3(-1, 0, 0)]);
+	float ls0m10 = -asfloat(InLevelset[ijk + int3(0, -1, 0)]);
+	float ls00m1 = -asfloat(InLevelset[ijk + int3(0, 0, -1)]);
+#else
+	float ls = InLevelset[ijk];
+	float ls100 = InLevelset[ijk + int3(1, 0, 0)];
+	float ls010 = InLevelset[ijk + int3(0, 1, 0)];
+	float ls001 = InLevelset[ijk + int3(0, 0, 1)];
+	float lsm100 = InLevelset[ijk + int3(-1, 0, 0)];
+	float ls0m10 = InLevelset[ijk + int3(0, -1, 0)];
+	float ls00m1 = InLevelset[ijk + int3(0, 0, -1)];
+#endif
+
+#if USE_SURFACE_OFFSET
+	ls -= SURFACE_LEVELSET_AT;
+	ls100 -= SURFACE_LEVELSET_AT;
+	ls010 -= SURFACE_LEVELSET_AT;
+	ls001 -= SURFACE_LEVELSET_AT;
+	lsm100 -= SURFACE_LEVELSET_AT;
+	ls0m10 -= SURFACE_LEVELSET_AT;
+	ls00m1 -= SURFACE_LEVELSET_AT;
+#endif
+
+	// Do one round of level set redistancing.
+#if (UPWIND_SCHEME == GODUNOVS_SCHEME) || (UPWIND_SCHEME == ENGQUIST_OSHER_SCHEME)
+	// See "A PDE-Based Fast Local Level Set Method", Peng et al. 1999
+	float a = 0, b = 0, c = 0, d = 0, e = 0, f = 0;
+	if (ls < 0)
+	{
+		// first order one sided... move to 2nd or 3rd order ENO?
+		a = min(0, ls - lsm100);
+		b = max(0, ls100 - ls);
+		c = min(0, ls - ls0m10);
+		d = max(0, ls010 - ls);
+		e = min(0, ls - ls00m1);
+		f = max(0, ls001 - ls);
+	}
+	else if (ls > 0)
+	{
+		a = max(0, ls - lsm100);
+		b = min(0, ls100 - ls);
+		c = max(0, ls - ls0m10);
+		d = min(0, ls010 - ls);
+		e = max(0, ls - ls00m1);
+		f = min(0, ls001 - ls);
+	}
+#if UPWIND_SCHEME == GODUNOVS_SCHEME
+	// compute the sum inside the sqrt of (40)
+	// Note: I believe there is a typo becayse the min of b*b,c*c can be 0 in both s^+ and s^- cases.  we want the highest change in each dimension.
+	const float GradLenSquared = max(a*a, b*b) + max(c*c, d*d) + max(e*e, f*f);
+#elif UPWIND_SCHEME == ENGQUIST_OSHER_SCHEME
+	// compute the sum inside the sqrt of (38)
+	const float GradLenSquared = a*a + b*b + c*c + d*d + e*e + f*f;
+#endif
+	// compute (36)... Assume Dd should be the same approximation of the grad(d) used in (37) 
+	// Actually, since we want dt = 0.5/|S|, we have no need to compute S at all... S/|S| = 1. We just need the sign.
+	const float S = ls / sqrt(ls*ls + GradLenSquared);
+//		ls = ls - 0.5*S / abs(S)*(sqrt(GradLenSquared) - 1.0f);
+	// do remember that sign(S) is -1 here.
+	ls = ls - 0.5*S*(sqrt(GradLenSquared) - 1.0f);
+#endif // GOUDUNOV or ENGQUIST_OSHER
+
+#if UPWIND_SCHEME == CRUDE_SCHEME
+	if (ls <= 0)
+	{
+		// grid point inside the liquid.
+		const float lsXMax = max(ls100, lsm100);
+		const float lsYMax = max(ls010, ls0m10);
+		const float lsZMax = max(ls001, ls00m1);
+		float lsMax = max(lsXMax, max(lsYMax, lsZMax));
+		if (lsMax <= 0)
+		{
+			// all neighbors are in the liquid.  redistance a bit.
+			ls = lsMax - 0.866f;
+		}
+	}
+	else
+	{
+		// grid point outside the liquid.
+		const float lsXMin = min(ls100, lsm100);
+		const float lsYMin = min(ls010, ls0m10);
+		const float lsZMin = min(ls001, ls00m1);
+		float lsMin = min(lsXMin, min(lsYMin, lsZMin));
+		if (lsMin > 0)
+		{
+			// all neighbors are out of the liquid.  redistance a bit.
+			ls = lsMin + 0.866f;
+		}
+	}
+#endif
+
+#if GRID_IS_LEVELSET
+	ls = clamp(ls, LS_MULTIPLIER*SURFACE_LEVELSET_AT, -LS_MULTIPLIER*(SURFACE_LEVELSET_AT));
+#else
+	ls = clamp(ls, SURFACE_LEVELSET_AT, -(SURFACE_LEVELSET_AT));
+#endif
+
+#if USE_SURFACE_OFFSET
+	ls += SURFACE_LEVELSET_AT;
+#endif
+
+#if OUTPUT_IS_UINT
+	ls = max(0, -ls);
+	OutLevelset[ijk] = asuint(ls);
+#else
+	OutLevelset[ijk] = ls;
+#endif
+}

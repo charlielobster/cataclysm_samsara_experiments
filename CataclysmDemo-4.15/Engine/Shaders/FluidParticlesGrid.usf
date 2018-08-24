@@ -1,0 +1,100 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidParticlesGrid
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture2D PositionTexture;
+StructuredBuffer<uint> InParticleIndices;
+
+StructuredBuffer<uint> SortedKeys;
+StructuredBuffer<uint> SortedValues;
+
+RWStructuredBuffer<uint> OutKeys;
+RWStructuredBuffer<uint> OutValues;
+
+AppendStructuredBuffer<uint> OutFirstParticleInVoxel;
+
+
+uint CalcParticlesCellIndex(float3 PosInVox)
+{
+	uint3 CellPos = PosInVoxToVoxelCoord(PosInVox);
+
+	uint CellIndex = (CellPos.z * (DOMAIN_SIZE_Y * DOMAIN_SIZE_X) + CellPos.y * DOMAIN_SIZE_X + CellPos.x);
+
+	return CellIndex;
+}
+
+[numthreads(GENERATE_PARTICLES_GRID_THREAD_COUNT, 1, 1)]
+void GenerateKeysAndValues( uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Buffer offsets.
+	uint InputIndex = DispatchThreadId.x;
+	if ( InputIndex < ParticleCount.ParticleCount )
+	{
+		// Read in the particle index and its position.
+		const uint ParticleIndex = InParticleIndices[InputIndex];
+		int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+		const float4 ParticlePosition = PositionTexture.Load(ParticleTexel);
+
+		uint CellIndex = 0xFFFFFFFF;
+		// Only the live particles are needed
+		[branch]
+		if ( ParticlePosition.w <= 1.f )
+		{
+			const float3 PositionInVoxel = WorldToVoxel(ParticlePosition.xyz);
+			CellIndex = CalcParticlesCellIndex(PositionInVoxel);
+		}
+
+		OutKeys[InputIndex] = CellIndex;
+		/// TODO!@# Use the InputIndex so we can just look up into every sorted array the same?
+		OutValues[InputIndex] = ParticleIndex;
+	}
+}
+
+[numthreads(GENERATE_PARTICLES_GRID_THREAD_COUNT, 1, 1)]
+void GenerateCellRanges(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex < ParticleCount.ParticleCount)
+	{
+		// mark cell start if keys are different between neighboring threads
+		uint key = SortedKeys[InputIndex];
+		uint prevKey = (InputIndex > 0) ? SortedKeys[InputIndex - 1] : -1;
+		if (key != -1) 
+		{
+			uint sameCount = 0;
+			uint CurCountIndex = InputIndex;
+			uint CurCountKey = key;
+			// sub voxels are different (only if we sort by sub voxel)... 
+			if (key != prevKey)
+			{
+				[unroll(MAX_SPLAT_COUNT)]
+				while (key == CurCountKey)
+				{
+					sameCount += 1;
+					CurCountIndex += 1;
+					CurCountKey = CurCountIndex < ParticleCount.ParticleCount ? SortedKeys[CurCountIndex] : -1;
+				}
+				OutFirstParticleInVoxel.Append((InputIndex << 10) | min(0x03ff, sameCount));
+			}
+			// voxels are different.
+#if 0
+			if ((key & 0xFFFFFFF8) != (prevKey & 0xFFFFFFF8))
+			{
+				[unroll(MAX_SPLAT_COUNT)]
+				while ((key & 0xFFFFFFF8) == (CurCountKey & 0xFFFFFFF8))
+				{
+					sameCount += 1;
+					CurCountIndex += 1;
+					CurCountKey = CurCountIndex < ParticleCount.ParticleCount ? SortedKeys[CurCountIndex] : -1;
+				}
+				OutFirstParticleInVoxel.Append((InputIndex << 10) | min(0x03ff, sameCount));
+			}
+#endif
+		}
+	}
+}

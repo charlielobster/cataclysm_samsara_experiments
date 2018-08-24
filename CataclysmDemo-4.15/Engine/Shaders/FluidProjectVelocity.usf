@@ -1,0 +1,244 @@
+#if 1
+// CATACLYSM 
+
+/*==============================================================================
+FluidProjectVelocity.usf: Compute the final and difference velocity.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> LiquidBoundary;
+Texture3D<float> Pressure;
+Texture3D<uint> Weights;
+
+RWTexture3D<float> OutU;
+RWTexture3D<float> OutV;
+RWTexture3D<float> OutW;
+RWTexture3D<uint> OutValidFlags;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void ProjectVelocity(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+#if 1
+	uint3 ijk = GetActiveIndex(DispatchThreadId);
+
+	float U = OutU[ijk];
+	float V = OutV[ijk];
+	float W = OutW[ijk];
+	uint ValidFlags = OutValidFlags[ijk];
+
+	// Get the liquid fractions
+	const uint uWeights = Weights[ijk];
+	const float3 lf = GetLiquidFractions(uWeights);
+
+	if (any(lf))
+	{
+
+		const float dx = DomainVoxelInfo.VoxelWidth*0.01;// voxelWidth is in cm, make it meters for the solver.
+
+		const float ls = LiquidBoundary[ijk] - SURFACE_LEVELSET_AT;
+
+		const float lsl = LiquidBoundary[ijk + int3(-1, 0, 0)] - SURFACE_LEVELSET_AT;
+		const float lsd = LiquidBoundary[ijk + int3(0, -1, 0)] - SURFACE_LEVELSET_AT;
+		const float lsb = LiquidBoundary[ijk + int3(0, 0, -1)] - SURFACE_LEVELSET_AT;
+
+		const float pc = Pressure[ijk]; // pressure at center
+
+										// left face
+		if (lf.x && (ls < 0 || lsl < 0))
+		{
+			const float pl = Pressure[ijk + int3(-1, 0, 0)];
+			ValidFlags |= 4;
+			float theta = 1;
+			if (ls >= 0)
+			{
+				theta = FractionInsideFast(lsl, ls);
+			}
+			else if (lsl >= 0)
+			{
+				theta = FractionInsideFast(ls, lsl);
+			}
+			U -= (pc - pl) / dx / theta;
+		}
+
+		// down face
+		if (lf.y && (ls < 0 || lsd < 0))
+		{
+			const float pd = Pressure[ijk + int3(0, -1, 0)];
+			ValidFlags |= 2;
+			float theta = 1;
+			if (ls >= 0)
+			{
+				theta = FractionInsideFast(lsd, ls);
+			}
+			else if (lsd >= 0)
+			{
+				theta = FractionInsideFast(ls, lsd);
+			}
+			V -= (pc - pd) / dx / theta;
+		}
+
+		// back face
+		if (lf.z && (ls < 0 || lsb < 0))
+		{
+			const float pb = Pressure[ijk + int3(0, 0, -1)];
+			ValidFlags |= 1;
+			float theta = 1;
+			if (ls >= 0)
+			{
+				theta = FractionInsideFast(lsb, ls);
+			}
+			else if (lsb >= 0)
+			{
+				theta = FractionInsideFast(ls, lsb);
+			}
+			W -= (pc - pb) / dx / theta;
+		}
+	}
+
+	OutU[ijk] = U;
+	OutV[ijk] = V;
+	OutW[ijk] = W;
+	OutValidFlags[ijk] = ValidFlags;
+#endif
+}
+
+#else
+
+
+// CATACLYSM 
+
+/*==============================================================================
+	FluidProjectVelocity.usf: Compute the final and difference velocity.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<uint> InVoxels;
+StructuredBuffer<uint> InCount;
+StructuredBuffer<float4> InPressureSolverParams;
+StructuredBuffer<float> InPressureOff;
+
+Texture3D<float> LiquidBoundary;
+Texture3D<float> InPressure;
+
+RWTexture3D<float> OutU;
+RWTexture3D<float> OutV;
+RWTexture3D<float> OutW;
+RWTexture3D<uint> OutValidFlags;
+
+[numthreads(PRESSURE_SOLVE_THREADS, 1, 1)]
+void ProjectVelocity(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+#if 1
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+	const float dx = DomainVoxelInfo.VoxelWidth*0.01;// voxelWidth is in cm, make it meters for the solver.
+
+	const uint3 ijk = IdxToVoxelAddress(InVoxels[InputIndex]);
+	//// TODO make sure to do off diag
+	float U = OutU[ijk];
+	float V = OutV[ijk];
+	float W = OutW[ijk];
+	uint ValidFlags = OutValidFlags[ijk];
+
+	// Get the liquid fractions
+
+	const float4 PressureSolverParams = InPressureSolverParams[InputIndex];
+	float lfl, lfr, lfd, lfu, lfb, lff; // liquid fraction in 6 directions
+	UnpackWeights(PressureSolverParams.xy, lfl, lfr, lfd, lfu, lfb, lff);
+
+	const float ls = LiquidBoundary[ijk] - SURFACE_LEVELSET_AT;
+	const float pc = InPressure[ijk]; // pressure at center
+
+	// left face
+	if (lfl)
+	{
+		const float lsl = LiquidBoundary[ijk + int3(-1, 0, 0)] - SURFACE_LEVELSET_AT;
+		const float pl =   InPressureOff[ijk + int3(-1, 0, 0)];
+		ValidFlags |= 4;
+		float theta = 1;
+		if (lsl >= 0)
+		{
+			theta = FractionInsideFast(ls, lsl);
+		}
+		U -= (pc - pl) / dx / theta;
+	}
+	// down face
+	if (lfd)
+	{
+		const float lsd = LiquidBoundary[ijk + int3(0, -1, 0)] - SURFACE_LEVELSET_AT;
+		const float pd =   InPressureOff[ijk + int3(0, -1, 0)];
+		ValidFlags |= 2;
+		float theta = 1;
+		if (lsd >= 0)
+		{
+			theta = FractionInsideFast(ls, lsd);
+		}
+		V -= (pc - pd) / dx / theta;
+	}
+	// back face
+	if (lfb)
+	{
+		const float lsb = LiquidBoundary[ijk + int3(0, 0, -1)] - SURFACE_LEVELSET_AT;
+		const float pb =   InPressureOff[ijk + int3(0, 0, -1)];
+		ValidFlags |= 1;
+		float theta = 1;
+		if (lsb >= 0)
+		{
+			theta = FractionInsideFast(ls, lsb);
+		}
+		W -= (pc - pb) / dx / theta;
+	}
+
+	OutU[ijk] = U;
+	OutV[ijk] = V;
+	OutW[ijk] = W;
+	OutValidFlags[ijk] = ValidFlags;
+
+
+
+	// right face
+	if (!pir && lfr)
+	{
+		OutValidFlags[ijk + int3(1, 0, 0)] |= 4;
+		const float lsr = LiquidBoundary[ijk + int3(1, 0, 0)] - SURFACE_LEVELSET_AT;
+		const float pr = 0.0f;
+		float theta = 1;
+		if (lsr >= 0)
+		{
+			theta = FractionInsideFast(ls, lsr);
+		}
+		OutU[ijk + int3(1, 0, 0)] -= (pr - pc) / dx / theta;
+	}
+	// up face
+	if (!piu && lfu)
+	{
+		OutValidFlags[ijk + int3(0, 1, 0)] |= 2;
+		const float lsu = LiquidBoundary[ijk + int3(0, 1, 0)] - SURFACE_LEVELSET_AT;
+		const float pu = 0.0f;
+		float theta = 1;
+		if (lsu >= 0)
+		{
+			theta = FractionInsideFast(ls, lsu);
+		}
+		OutV[ijk + int3(0, 1, 0)] -= (pu - pc) / dx / theta;
+	}
+	// front face
+	if (!pif && lff)
+	{
+		OutValidFlags[ijk + int3(0, 0, 1)] |= 1;
+		const float lsf = LiquidBoundary[ijk + int3(0, 0, 1)] - SURFACE_LEVELSET_AT;
+		const float pf = 0.0f;
+		float theta = 1;
+		if (lsf >= 0)
+		{
+			theta = FractionInsideFast(ls, lsf);
+		}
+		OutW[ijk + int3(0, 0, 1)] -= (pf - pc) / dx / theta;
+	}
+#endif
+}
+#endif

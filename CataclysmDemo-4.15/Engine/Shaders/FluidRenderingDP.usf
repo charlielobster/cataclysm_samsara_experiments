@@ -1,0 +1,115 @@
+// CATACLYSM
+
+#include "Common.usf"
+#include "SHCommon.usf"
+#include "VertexFactoryCommon.usf"
+#include "ReflectionEnvironmentShared.usf"
+#include "FluidRenderingCommon.usf"
+
+
+
+// Generate a random float in [0, 1] based on wang hash
+float rand_float(uint seed)
+{
+	seed = (seed ^ 61) ^ (seed >> 16);
+	seed *= 9;
+	seed = seed ^ (seed >> 4);
+	seed *= 0x27d4eb2d;
+	seed = seed ^ (seed >> 15);
+
+	return float(seed) * (1.0 / 4294967295.0);
+}
+
+//------------------------------------------------------------------------------
+
+StructuredBuffer<float4> ParticlesPositionBuffer;
+StructuredBuffer<float> ParticlesRenderAttrBuffer;
+
+float2 DParticleRadiusMinMax;
+
+struct VS_Output
+{
+	float4 ClipPosition : Position;
+	float Radius : TexCoord0;
+	float3 Color : Color0;
+};
+
+static const float3 ColorTable[3] =
+{
+	float3(1, 0, 0),
+	float3(0, 1, 0),
+	float3(0, 0, 1),
+};
+
+VS_Output VSMain(uint ParticleIndex : SV_InstanceID)
+{
+	const float4 ParticlePosition = ParticlesPositionBuffer[ParticleIndex];
+	const uint ParticleType = uint(ParticlePosition.w) >> 1;
+	const float ParticleAttr = ParticlesRenderAttrBuffer[ParticleIndex];
+
+	VS_Output Out;
+	Out.ClipPosition = mul(float4(ParticlePosition.xyz, 1), View.WorldToClip);
+	Out.Color = ColorTable[ParticleType] * ParticleAttr.x;
+	Out.Radius = lerp(DParticleRadiusMinMax.x, DParticleRadiusMinMax.y, rand_float(ParticleIndex));
+	return Out;
+}
+
+struct GS_Output
+{
+	noperspective centroid float4 Position : SV_POSITION;
+	noperspective centroid float2 TexCoord : TEXCOORD0;
+	nointerpolation float3 Color : COLOR0;
+	//nointerpolation uint Slice : SV_RenderTargetArrayIndex;
+};
+
+static const float2 QuadOffsets[4] =
+{
+	float2(-1,  1),
+	float2( 1,  1),
+	float2(-1, -1),
+	float2( 1, -1),
+};
+
+
+
+[maxvertexcount(4)]
+void GSMain(point VS_Output In[1], inout TriangleStream<GS_Output> OutStream)
+{
+	float2 ClipExtent = In[0].Radius * float2(View.ViewToClip[0][0], View.ViewToClip[1][1]);
+	{
+		GS_Output Out;
+		// Emit two new triangles
+		for (int i = 0; i < 4; i++)
+		{
+			// Transform to clip space
+			float4 ClipPosition = In[0].ClipPosition; ClipPosition.xy += QuadOffsets[i] * ClipExtent;
+			Out.Position = ClipPosition;
+			Out.TexCoord = QuadOffsets[i];
+			Out.Color = In[0].Color;
+			//Out.Slice = uint(In[0].Type);
+
+			OutStream.Append(Out);
+		}
+		OutStream.RestartStrip();
+	}
+}
+
+void PSMain(
+	GS_Output In,
+	out float3 OutColor : SV_Target0
+	)
+{
+	float RadiusSq = dot(In.TexCoord, In.TexCoord);
+	if (RadiusSq > 1)
+	{
+		discard;
+	}
+	else
+	{
+		
+		OutColor = In.Color;
+		OutColor.r *= RadiusSq; //bubble
+		OutColor.g *= (1 - pow(RadiusSq, 2.25f * 0.5f)); //foam
+		OutColor.b *= (1 - pow(RadiusSq, 1.5f * 0.5f)); //spray
+	}
+}

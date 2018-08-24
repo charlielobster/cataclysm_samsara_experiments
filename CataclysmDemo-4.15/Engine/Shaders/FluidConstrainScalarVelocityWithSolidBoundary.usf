@@ -1,0 +1,315 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidConstrainScalarVelocityWithSolidBoundary.usf Constrain all valid velocities inside the nodal solid object to be perpendicular or way from the solid normal.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+float3 GetIsValid(uint ValidFlags)
+{
+	return float3((ValidFlags & 4) ? 1 : 0, (ValidFlags & 2) ? 1 : 0, (ValidFlags & 1) ? 1 : 0);
+}
+
+#if GET_FACES_TO_CONSTRAIN
+Texture3D<uint> InValidFlags;// containes flags of 0x100 for valid x, 0x010 for y, and 0x001 for z 
+Texture3D<uint> InWeights;
+AppendStructuredBuffer<uint> OutFaces;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void ConstrainGetFaces(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 ijk = GetActiveIndex(DispatchThreadId);
+
+#if 1 
+	const uint ValidFlags = InValidFlags[ijk];
+	const float3 Valid = GetIsValid(ValidFlags);
+	// weightflags should have 0x04 if VelocityWeight.x == 0, 0x02 if VelocityWeight.y == 0, and 0x01 if VelocityWeight.z == 0
+	const float3 Weights = GetLiquidFractions(InWeights[ijk]);
+
+	uint WeightFlag = 0;
+	WeightFlag |= Weights.x ? 0 : 4;
+	WeightFlag |= Weights.y ? 0 : 2;
+	WeightFlag |= Weights.z ? 0 : 1;
+
+	int3 ConstrainFace = int3(
+		(WeightFlag & 4) && Valid.x,
+		(WeightFlag & 2) && Valid.y,
+		(WeightFlag & 1) && Valid.z);
+
+	if (ConstrainFace.x) OutFaces.Append(AddressToFaceIdx(uint4(ijk, 4)));
+	if (ConstrainFace.y) OutFaces.Append(AddressToFaceIdx(uint4(ijk, 2)));
+	if (ConstrainFace.z) OutFaces.Append(AddressToFaceIdx(uint4(ijk, 1)));
+#endif
+}
+
+#endif
+
+#if FILL_VELOCITY_BUFFER
+Texture3D<uint> InValidFlags;// containes flags of 0x100 for valid x, 0x010 for y, and 0x001 for z 
+Texture3D<float> InU;
+Texture3D<float> InV;
+Texture3D<float> InW;
+StructuredBuffer<uint> InFaces;
+StructuredBuffer<uint> InCount;
+RWStructuredBuffer<float2> OutConstrainVelocityParams;
+[numthreads(128, 1, 1)]
+void ConstrainFillVelocityBuffer(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	const uint4 ijk_comp = IdxToFaceAddress(InFaces[InputIndex]);
+	const uint3 ijk = ijk_comp.xyz;
+	const uint comp = ijk_comp.w;
+
+#if 1 
+	const uint ValidFlags = InValidFlags[ijk];
+	const float3 Valid = GetIsValid(ValidFlags);
+	float2 outVel = 0;
+	float2 numValid = 0;
+
+	if (comp & 4) // U
+	{
+		const float3 Valid_00p = GetIsValid(InValidFlags[ijk + int3(0, 0, 1)]);
+		const float3 Valid_m00 = GetIsValid(InValidFlags[ijk + int3(-1, 0, 0)]);
+		const float3 Valid_0p0 = GetIsValid(InValidFlags[ijk + int3(0, 1, 0)]);
+		const float3 Valid_mp0 = GetIsValid(InValidFlags[ijk + int3(-1, 1, 0)]);
+		const float3 Valid_m0p = GetIsValid(InValidFlags[ijk + int3(-1, 0, 1)]);
+		if (Valid.y)
+		{
+			numValid.x += 1;
+			outVel.x += InV[ijk];
+		}
+		if (Valid_m00.y)
+		{
+			numValid.x += 1;
+			outVel.x += InV[ijk + int3(-1, 0, 0)];
+		}
+		if (Valid_0p0.y)
+		{
+			numValid.x += 1;
+			outVel.x += InV[ijk + int3(0, 1, 0)];
+		}
+		if (Valid_mp0.y)
+		{
+			numValid.x += 1;
+			outVel.x += InV[ijk + int3(-1, 1, 0)];
+		}
+
+		if (Valid.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk];
+		}
+		if (Valid_m00.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk + int3(-1, 0, 0)];
+		}
+		if (Valid_00p.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk + int3(0, 0, 1)];
+		}
+		if (Valid_m0p.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk + int3(-1, 0, 1)];
+		}
+	}
+	else if (comp & 2) // V
+	{
+		const float3 Valid_00p = GetIsValid(InValidFlags[ijk + int3(0, 0, 1)]);
+		const float3 Valid_0m0 = GetIsValid(InValidFlags[ijk + int3(0, -1, 0)]);
+		const float3 Valid_p00 = GetIsValid(InValidFlags[ijk + int3(1, 0, 0)]);
+		const float3 Valid_0mp = GetIsValid(InValidFlags[ijk + int3(0, -1, 1)]);
+		const float3 Valid_pm0 = GetIsValid(InValidFlags[ijk + int3(1, -1, 0)]);
+		if (Valid.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk];
+		}
+		if (Valid_0m0.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk + int3(0, -1, 0)];
+		}
+		if (Valid_p00.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk + int3(1, 0, 0)];
+		}
+		if (Valid_pm0.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk + int3(1, -1, 0)];
+		}
+
+		if (Valid.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk];
+		}
+		if (Valid_0m0.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk + int3(0, -1, 0)];
+		}
+		if (Valid_00p.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk + int3(0, 0, 1)];
+		}
+		if (Valid_0mp.z)
+		{
+			numValid.y += 1;
+			outVel.y += InW[ijk + int3(0, -1, 1)];
+		}
+	}
+	else if (comp & 1) // W
+	{
+		const float3 Valid_00m = GetIsValid(InValidFlags[ijk + int3(0, 0, -1)]);
+		const float3 Valid_p00 = GetIsValid(InValidFlags[ijk + int3(1, 0, 0)]);
+		const float3 Valid_0pm = GetIsValid(InValidFlags[ijk + int3(0, 1, -1)]);
+		const float3 Valid_p0m = GetIsValid(InValidFlags[ijk + int3(1, 0, -1)]);
+		const float3 Valid_0p0 = GetIsValid(InValidFlags[ijk + int3(0, 1, 0)]);
+		if (Valid.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk];
+		}
+		if (Valid_00m.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk + int3(0, 0, -1)];
+		}
+		if (Valid_p00.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk + int3(1, 0, 0)];
+		}
+		if (Valid_p0m.x)
+		{
+			numValid.x += 1;
+			outVel.x += InU[ijk + int3(1, 0, -1)];
+		}
+
+
+		if (Valid.y)
+		{
+			numValid.y += 1;
+			outVel.y += InV[ijk];
+		}
+		if (Valid_00m.y)
+		{
+			numValid.y += 1;
+			outVel.y += InV[ijk + int3(0, 0, -1)];
+		}
+		if (Valid_0p0.y)
+		{
+			numValid.y += 1;
+			outVel.y += InV[ijk + int3(0, 1, 0)];
+		}
+		if (Valid_0pm.y)
+		{
+			numValid.y += 1;
+			outVel.y += InV[ijk + int3(0, 1, -1)];
+		}
+	}
+	numValid = max(numValid, 1);
+	OutConstrainVelocityParams[InputIndex] = outVel/numValid;
+
+#endif
+}
+
+#endif
+
+#if CONSTRAIN_SCALAR_VELOCITY
+StructuredBuffer<uint> InFaces;
+StructuredBuffer<uint> InCount;
+StructuredBuffer<float2> InConstrainVelocityParams;
+
+Texture3D<float> InSolidBoundary;// nodal not cell centered.
+
+RWTexture3D<float> OutU;
+RWTexture3D<float> OutV;
+RWTexture3D<float> OutW;
+
+[numthreads(128, 1, 1)]
+void ConstrainScalarVelocityWithSolidBoundary(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	const uint4 ijk_comp = IdxToFaceAddress(InFaces[InputIndex]);
+	const uint3 ijk = ijk_comp.xyz;
+	const uint comp = ijk_comp.w;
+
+#if 1 
+	const float2 inVel = InConstrainVelocityParams[InputIndex];
+	const float s000 = InSolidBoundary[ijk + int3(0, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float s001 = InSolidBoundary[ijk + int3(0, 0, 1)] - SURFACE_LEVELSET_AT;
+	const float s010 = InSolidBoundary[ijk + int3(0, 1, 0)] - SURFACE_LEVELSET_AT;
+	const float s011 = InSolidBoundary[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+	const float s100 = InSolidBoundary[ijk + int3(1, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float s101 = InSolidBoundary[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+	const float s110 = InSolidBoundary[ijk + int3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+	const float s111 = InSolidBoundary[ijk + int3(1, 1, 1)] - SURFACE_LEVELSET_AT;
+
+	if (comp & 4) // U
+	{
+		const float sm00 = InSolidBoundary[ijk + int3(-1, 0, 0)] - SURFACE_LEVELSET_AT;
+		const float sm01 = InSolidBoundary[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+		const float sm10 = InSolidBoundary[ijk + int3(-1, 1, 0)] - SURFACE_LEVELSET_AT;
+		const float sm11 = InSolidBoundary[ijk + int3(-1, 1, 1)] - SURFACE_LEVELSET_AT;
+
+		float3 U_Vel = float3(OutU[ijk], inVel.x, inVel.y);
+		const float3 grad = float3(0.25*(s100 - sm00 + s101 - sm01 + s110 - sm10 + s111 - sm11), s010 - s000 + s011 - s001, s001 - s000 + s011 - s010);
+		const float len = length(grad);
+		if (len)
+		{
+			const float3 n = grad / len;
+			const float perp_component = min(0, dot(U_Vel, n));
+			OutU[ijk] = U_Vel.x - perp_component * n.x;
+		}
+	}
+	else if (comp & 2) // V
+	{
+		const float s0m0 = InSolidBoundary[ijk + int3(0, -1, 0)] - SURFACE_LEVELSET_AT;
+		const float s0m1 = InSolidBoundary[ijk + int3(0, -1, 1)] - SURFACE_LEVELSET_AT;
+		const float s1m0 = InSolidBoundary[ijk + int3(1, -1, 0)] - SURFACE_LEVELSET_AT;
+		const float s1m1 = InSolidBoundary[ijk + int3(1, -1, 1)] - SURFACE_LEVELSET_AT;
+
+		float3 V_Vel = float3(inVel.x, OutV[ijk], inVel.y);
+		const float3 grad = float3(s100 - s000 + s101 - s001, 0.25*(s010 - s0m0 + s011 - s0m1 + s110 - s1m0 + s111 - s1m1), s001 - s000 + s101 - s100);
+		const float len = length(grad);
+		if (len)
+		{
+			const float3 n = grad / len;
+			const float perp_component = min(0, dot(V_Vel, n));
+			OutV[ijk] = V_Vel.y - perp_component * n.y;
+		}
+	}
+	else if (comp & 1) // W
+	{
+		const float s00m = InSolidBoundary[ijk + int3(0, 0, -1)] - SURFACE_LEVELSET_AT;
+		const float s01m = InSolidBoundary[ijk + int3(0, 1, -1)] - SURFACE_LEVELSET_AT;
+		const float s10m = InSolidBoundary[ijk + int3(1, 0, -1)] - SURFACE_LEVELSET_AT;
+		const float s11m = InSolidBoundary[ijk + int3(1, 1, -1)] - SURFACE_LEVELSET_AT;
+
+		float3 W_Vel = float3(inVel.x, inVel.y, OutW[ijk]);
+		const float3 grad = float3(s100 - s000 + s110 - s010, s010 - s000 + s110 - s100, 0.25*(s001 - s00m + s011 - s01m + s101 - s10m + s111 - s11m));
+		const float len = length(grad);
+		if (len)
+		{
+			const float3 n = grad / len;
+			const float perp_component = min(0, dot(W_Vel, n));
+			OutW[ijk] = W_Vel.z - perp_component * n.z;
+		}
+	}
+
+#endif
+}
+#endif

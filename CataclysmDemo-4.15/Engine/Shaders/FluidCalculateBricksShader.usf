@@ -1,0 +1,40 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidCalculateBricksShader.usf: Shader to compute the list of bricks from the brick map.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommonDefines.usf"
+
+/** Texture containing particle positions. */
+Texture3D<uint> CurrentBrickMapTexture;
+Texture3D<uint> PrevBrickMapTexture;
+
+/** Output tiles. */ 
+AppendStructuredBuffer<uint> OutChangedBricks;
+AppendStructuredBuffer<uint> OutActiveBricks;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void CalculateBricks( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint CurrentValue = CurrentBrickMapTexture[DispatchThreadId];
+	uint PrevValue = PrevBrickMapTexture[DispatchThreadId];
+	// @note make sure this matches FBrickIndex::CoordToIdx
+	uint outIndex = BRICK_IDX_MASK & ((((DispatchThreadId.z << BRICK_IDX_BITS_Y) | DispatchThreadId.y) << BRICK_IDX_BITS_X) | DispatchThreadId.x);
+	if (CurrentValue)
+	{
+		OutActiveBricks.Append(outIndex);
+	}
+
+	[branch]
+	if (CurrentValue && !PrevValue) // new mapped
+	{
+		OutChangedBricks.Append(outIndex);
+	}
+	else if (!CurrentValue && PrevValue) // unmapped
+	{
+		// Tack on a bit to mark if the brick needs unmapped.
+		OutChangedBricks.Append(0x80000000 | outIndex);
+	}
+}

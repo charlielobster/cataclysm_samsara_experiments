@@ -1,0 +1,44 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidGetLiquidVoxels.usf
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> LiquidBoundary;
+Texture3D<uint> Weights;
+
+RWTexture3D<float> OutFloat0;
+RWTexture3D<float> OutFloat1;
+
+AppendStructuredBuffer<uint> OutLiquidVoxels;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void GetLiquidVoxels( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint3 ijk = GetActiveIndex(DispatchThreadId);
+
+	const float ls000 = LiquidBoundary[ijk] - SURFACE_LEVELSET_AT;
+	if (ls000 < 0) // in Liquid
+	{
+
+		// Get the liquid fractions
+		float3 Weights000 = GetLiquidFractions(Weights[ijk]);
+		bool AddVoxel = any(Weights000);
+		if (!AddVoxel)
+		{
+			float3 WeightsOff = GetLiquidFractions(Weights[ijk + int3(1, 0, 0)], Weights[ijk + int3(0, 1, 0)], Weights[ijk + int3(0, 0, 1)]);
+			AddVoxel = any(WeightsOff);
+		}
+
+		if (AddVoxel)
+		{
+			OutLiquidVoxels.Append(AddressToVoxelIdx(ijk));
+		}
+	}
+
+	OutFloat0[ijk] = 0.0f;
+	OutFloat1[ijk] = 0.0f;
+}

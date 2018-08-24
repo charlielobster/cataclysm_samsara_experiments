@@ -1,0 +1,147 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidGetBricksDataShader.usf: Shader get bricks data from VTR
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+/** Input Bricks Ids Data. */
+Buffer<uint> BricksIdList;
+
+/** Input VTR Resource. */
+Texture3D
+#if IS_FLOAT
+<float>
+#elif IS_FLOAT2
+<float2>
+#elif IS_FLOAT4
+<float4>
+#elif IS_UINT
+<uint>
+#endif
+InputVTR;
+
+/** Output Bricks Data. */
+AppendStructuredBuffer<float2> OutBricksData;
+
+float GetVTRData(uint3 coord,uint componentIndex)
+{
+	// Component Index 4 is for length of first 3 components.
+	float result = 0;
+#if IS_FLOAT
+	if (componentIndex == 4)
+	{
+		result = abs(InputVTR[coord].x);
+	}
+	else
+	{
+		result = InputVTR[coord].x;
+	}
+#elif IS_FLOAT2	
+	switch(componentIndex)
+	{
+		case 0:
+			result = InputVTR[coord].x;
+			break;
+		case 1:
+			result = InputVTR[coord].y;		
+			break;
+		default:
+			result = length(InputVTR[coord]);
+			break;
+	}
+#elif IS_FLOAT4
+	switch(componentIndex)
+	{
+		case 0:
+			result = InputVTR[coord].x;
+			break;
+		case 1:
+			result = InputVTR[coord].y;		
+			break;
+		case 2:
+			result = InputVTR[coord].z;
+			break;
+		case 3:
+			result = InputVTR[coord].w;
+			break;
+		case 5:
+			// with case 5, we assume that w is a set of ValidFlags, where 4 means x is valid, 2 means y is valid, and 1 means z is valid. and grid is staggered
+			{
+				float4 Vec000 = InputVTR[coord];
+				float4 Vec100 = InputVTR[coord + int3(1, 0, 0)];
+				float4 Vec010 = InputVTR[coord + int3(0, 1, 0)];
+				float4 Vec001 = InputVTR[coord + int3(0, 0, 1)];
+				bool vl = uint(Vec000.w) & 4;
+				bool vr = uint(Vec100.w) & 4;
+				bool vd = uint(Vec000.w) & 2;
+				bool vu = uint(Vec010.w) & 2;
+				bool vb = uint(Vec000.w) & 1;
+				bool vf = uint(Vec001.w) & 1;
+				float3 resultVec = float3(0, 0, 0);
+				resultVec.x = (vl && vr) ? 0.5f*(Vec000.x + Vec100.x) : vl ? Vec000.x : vr ? Vec100.x : 0;
+				resultVec.y = (vd && vu) ? 0.5f*(Vec000.y + Vec010.y) : vd ? Vec000.y : vu ? Vec010.y : 0;
+				resultVec.z = (vb && vf) ? 0.5f*(Vec000.z + Vec001.z) : vb ? Vec000.z : vf ? Vec001.z : 0;
+				result = length(resultVec);
+			}
+			break;
+		default:
+			result = length(InputVTR[coord].xyz);
+			break;
+
+	}	
+#elif IS_UINT
+	result = (float)InputVTR[coord].x;
+#endif
+
+	return result;
+}
+
+uint3 GetCoordinates(uint Index)
+{
+	uint3 coord;
+
+	coord.x = Index & BRICK_IDX_MASK_X;
+	coord.y = (Index >> BRICK_IDX_BITS_X) & BRICK_IDX_MASK_Y;
+	coord.z = (Index >> (BRICK_IDX_BITS_X + BRICK_IDX_BITS_Y)) & BRICK_IDX_MASK_Z;
+
+	return coord;
+}
+
+[numthreads(GET_BRICK_DATA_THREAD_COUNT, 1, 1)]
+void GetBricksData( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+#if IS_LEVELSET
+	const uint brick_size_x = LS_BRICK_SIZE_X;
+	const uint brick_size_y = LS_BRICK_SIZE_Y;
+	const uint brick_size_z = LS_BRICK_SIZE_Z;
+#else
+	const uint brick_size_x = BRICK_SIZE_X;
+	const uint brick_size_y = BRICK_SIZE_Y;
+	const uint brick_size_z = BRICK_SIZE_Z;
+#endif
+
+	uint brickIndex = DispatchThreadId.x;
+	if(brickIndex < BrickDebuggerInfo.BricksNum)
+	{
+		uint brickId = BricksIdList[brickIndex];
+
+		// Get Volume Index From BrickId
+		uint3 brickCoord = GetCoordinates(brickId);
+		uint3 volumeCoord = brickCoord * uint3(brick_size_x, brick_size_y, brick_size_z);
+		for (uint k = 0; k < brick_size_z; k++)
+		{
+			for(uint j = 0; j < brick_size_y; j++)
+			{		
+				for (uint i = 0; i < brick_size_x; i++)
+				{
+					uint3 newPos = volumeCoord + int3(i,j,k);
+					float data = GetVTRData(newPos,BrickDebuggerInfo.IndexOfComponent);
+					OutBricksData.Append(float2(brickId,data));
+				}
+			}
+		}
+	}
+}

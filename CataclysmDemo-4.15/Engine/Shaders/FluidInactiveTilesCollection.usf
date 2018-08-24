@@ -1,0 +1,56 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidInactiveTilesCollection.usf: Shader to collect all inactive particle tiles
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommonDefines.usf"
+
+/** Textures containing particle inromation. */
+// position is 32 bits per component
+Texture2D PositionTexture;
+
+/** Input buffer containing tiles offsets. */
+Buffer<float2> TileOffsets;
+
+/** Output */
+AppendStructuredBuffer<uint> OutInactiveTiles;
+
+
+
+// GPU particles are arranged as Linear at texture
+[numthreads(CREATE_BRICK_MAP_THREADS_COUNT, 1, 1)]
+void InactiveTilesCollection(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Buffer offsets.
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex < TileInfo.TileCount)
+	{
+		// Read in the particle index and its position.
+		const float2 TileOffset = TileOffsets[InputIndex];
+		if(TileOffset.x <= 1.0f && TileOffset.y <= 1.0f)
+		{
+			int InActiveParticles = 0;
+			for(int x = 0; x < 4; x++)
+			{
+				for(int y = 0; y < 4; y++)
+				{
+					const float2 Texcoord = TileOffset + float2((x + 0.5f) / GPU_PARTICLE_SIM_TEXTURE_SIZE_X, (y + 0.5f) / GPU_PARTICLE_SIM_TEXTURE_SIZE_Y);
+					int3 ParticleTexel = int3(Texcoord * int2(GPU_PARTICLE_SIM_TEXTURE_SIZE_X, GPU_PARTICLE_SIM_TEXTURE_SIZE_Y), 0);
+					const float4 ParticlePosition = PositionTexture.Load(ParticleTexel);
+					if ( ParticlePosition.x != 0.0f && ParticlePosition.y != 0.0f && ParticlePosition.z != 0.0f && ParticlePosition.w > 1.0f )
+					{
+						InActiveParticles++;
+					}
+				}
+			}
+
+			if (InActiveParticles == 16)
+			{
+				uint TileIndex = uint(TileOffset.y * (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y / 4) * (GPU_PARTICLE_SIM_TEXTURE_SIZE_X / 4)) + uint(TileOffset.x * (GPU_PARTICLE_SIM_TEXTURE_SIZE_X / 4));
+				OutInactiveTiles.Append(TileIndex);
+			}
+		}
+	}
+}

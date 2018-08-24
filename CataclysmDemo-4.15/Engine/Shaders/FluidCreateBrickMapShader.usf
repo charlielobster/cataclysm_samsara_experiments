@@ -1,0 +1,87 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidCreateBrickMapShader.usf: Shader to occupy the brick map where particles exist.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+/** Textures containing particle inromation. */
+// position is 32 bits per component
+Texture2D PositionTexture;
+
+/** Input buffer containing particle indices. */
+Buffer<float2> InParticleIndices;
+
+/** Output */
+RWTexture3D<uint> BrickMapRW;
+RWTexture3D<uint> OutParticlesPerVoxel;
+
+/** Output Indices. */
+AppendStructuredBuffer<uint> OutParticleIndices;
+AppendStructuredBuffer<uint> OutBricksWithParticles;
+AppendStructuredBuffer<uint> OutParticlesToSort;
+
+
+// GPU particles are arranged as Linear at texture
+[numthreads(CREATE_BRICK_MAP_THREADS_COUNT, 1, 1)]
+void CreateBrickMap(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Buffer offsets.
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex < ParticleCount.ParticleCount)
+	{
+		// Read in the particle index and its position.
+		const float2 ParticleIndex = InParticleIndices[InputIndex];
+		int3 ParticleTexel = int3(ParticleIndex.xy * int2(GPU_PARTICLE_SIM_TEXTURE_SIZE_X, GPU_PARTICLE_SIM_TEXTURE_SIZE_Y), 0);
+		const float4 ParticlePosition = PositionTexture.Load(ParticleTexel);
+
+		// Update tile mappings with positions
+		// TODO ignore particles that are out of the domain, instead of clamping.
+		// Only the live particles are needed
+		if ( ParticlePosition.w <= 1.0f )
+		{
+			float3 posInVoxel = WorldToVoxel(ParticlePosition.xyz);
+			if (posInVoxel.x >= 0 && posInVoxel.x < (DOMAIN_SIZE_X) &&
+				posInVoxel.y >= 0 && posInVoxel.y < (DOMAIN_SIZE_Y) &&
+				posInVoxel.z >= 0 && posInVoxel.z < (DOMAIN_SIZE_Z))
+			{
+				
+				uint3 VoxelCoord = PosInVoxToVoxelCoord(posInVoxel);
+				// count the particles and insert if needed.
+				uint LastCount;
+				InterlockedAdd(OutParticlesPerVoxel[VoxelCoord], 1, LastCount);
+
+				// add the particle to the active particle list
+				uint outIndex = (ParticleTexel.x << GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y) | ParticleTexel.y;
+				[branch]
+				if (LastCount < MAX_SPLAT_COUNT)
+				{
+					OutParticlesToSort.Append(outIndex);
+				}
+				else
+				{
+					/// These are now the extra particle indices.
+					OutParticleIndices.Append(outIndex);
+				}
+
+				// mark the Brick Map
+				uint3 ijk = VoxelCoord >> int3(BRICK_SIZE_BITS_X, BRICK_SIZE_BITS_Y, BRICK_SIZE_BITS_Z);
+				uint origVal;
+				InterlockedExchange(BrickMapRW[ijk], 1, origVal);
+				
+				// if it's the first time marking, then add an entry into the BricksWithParticles list.
+				[branch]
+				if (origVal == 0)
+				{
+					// first time mapped.
+
+					// @note make sure this matches FBrickIndex::CoordToIdx
+					uint outBrickIndex = BRICK_IDX_MASK & ((((ijk.z << BRICK_IDX_BITS_Y) | ijk.y) << BRICK_IDX_BITS_X) | ijk.x);
+					OutBricksWithParticles.Append(outBrickIndex);
+				}
+			}
+		}
+	}
+}

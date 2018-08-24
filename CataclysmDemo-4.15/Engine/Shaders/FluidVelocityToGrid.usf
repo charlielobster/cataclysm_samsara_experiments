@@ -1,0 +1,138 @@
+// CATACLYSM 
+
+/*==============================================================================
+FluidVelocityToGrid.usf
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+// if 1, use the sharp kernel (3) in Preserving Fluid Sheets With Adaptively Sampled Anisotropic Particles.
+#define USE_SHARP_VELOCITY_KERNEL 1
+
+StructuredBuffer<uint> ParticleVoxels;
+StructuredBuffer<uint> InCount;
+
+StructuredBuffer<uint> SortedParticleIndices;
+StructuredBuffer<float4> InPosInVox;
+Texture2D VelocityTexture;
+
+#include "nvHLSLExtns.usf"
+RWTexture3D<float> OutVelocity;
+RWTexture3D<float> OutWeight;
+RWTexture3D<float> OutVelocityV;
+RWTexture3D<float> OutWeightV;
+RWTexture3D<float> OutVelocityW;
+RWTexture3D<float> OutWeightW;
+
+
+#define UNROLL_TO MAX_SPLAT_COUNT
+// larger splat ring.
+#define USE_LARGE_SPLAT_RING 1
+
+#if USE_LARGE_SPLAT_RING
+#define SPLAT_WIDTH 3
+#define RAD (1.23f)
+#else
+#define SPLAT_WIDTH 3
+#define RAD (1.0f)
+#endif
+float GetWt(float3 Diff)
+{
+	float DistSqr = max(0.001f, dot(Diff, Diff));
+	float Wt =
+		0.01f*max(((RAD*RAD) / DistSqr - 1.0f), 0.0f);
+	return Wt;
+}
+[numthreads(PARTICLES_TO_GRID_THREADS, 2, 3)]
+void VelocityToGrid(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	uint FistParticleInVoxelAndNum = ParticleVoxels[InputIndex];
+	uint VoxelIndex = FistParticleInVoxelAndNum >> 10;
+	uint NumInVox = FistParticleInVoxelAndNum & 0x3ff;
+
+	const uint3 ijkCell = PosInVoxToVoxelCoord(InPosInVox[VoxelIndex].xyz);
+
+	uint Start = VoxelIndex;
+	uint End = VoxelIndex + NumInVox;
+
+	if (Start >= End) return;
+#if 1 // set to 0 to bypass shader.	
+
+	const int3 ijkMin = ijkCell
+		- int3(DispatchThreadId.z == 0 ? 0 : 1, DispatchThreadId.z == 1 ? 0 : 1, DispatchThreadId.z == 2 ? 0 : 1)
+		+ int3(DispatchThreadId.z == 0 ? DispatchThreadId.y : 0, DispatchThreadId.z == 1 ? DispatchThreadId.y : 0, DispatchThreadId.z == 2 ? DispatchThreadId.y : 0);
+
+	float C_Velocity[SPLAT_WIDTH*SPLAT_WIDTH];
+	float C_Weight[SPLAT_WIDTH*SPLAT_WIDTH];
+
+	[unroll(SPLAT_WIDTH*SPLAT_WIDTH)]
+	for (int i = 0; i < SPLAT_WIDTH*SPLAT_WIDTH; ++i)
+	{
+		C_Velocity[i] = 0;
+		C_Weight[i] = 0;
+	}
+
+	[unroll(UNROLL_TO)]
+	for (uint Index = Start; Index < End; ++Index)
+	{
+		const uint ParticleIndex = SortedParticleIndices[Index];
+		const int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+
+		const float3 PositionInVoxel = InPosInVox[Index].xyz;
+		const float3 ParticleVelocity = mul(0.01f, VelocityTexture.Load(ParticleTexel).xyz);// cm to m
+		const float velocity = DispatchThreadId.z == 0 ? ParticleVelocity.x : (DispatchThreadId.z == 1 ? ParticleVelocity.y : ParticleVelocity.z);
+
+		[unroll(SPLAT_WIDTH)]
+		for (int ao = 0; ao < SPLAT_WIDTH; ao++)
+		{
+			[unroll(SPLAT_WIDTH)]
+			for (int bo = 0; bo < SPLAT_WIDTH; bo++)
+			{
+				const int i = (ao * SPLAT_WIDTH + bo);
+				const int3 ijk = ijkMin +
+					(DispatchThreadId.z == 0 ? int3(0, ao, bo) : (DispatchThreadId.z == 1 ? int3(ao, 0, bo) : int3(ao, bo, 0)));
+				const float3 Diff = float3(ijk) - PositionInVoxel + float3(DispatchThreadId.z == 0 ? 0.0f : 0.5f, DispatchThreadId.z == 1 ? 0.0f : 0.5f, DispatchThreadId.z == 2 ? 0.0f : 0.5f);
+
+
+				float weight = GetWt(Diff);
+				C_Velocity[i] += weight*velocity;
+				C_Weight[i] += weight;
+			}
+		}
+	}
+
+	[unroll(SPLAT_WIDTH)]
+	for (int ao = 0; ao < SPLAT_WIDTH; ao++)
+	{
+		[unroll(SPLAT_WIDTH)]
+		for (int bo = 0; bo < SPLAT_WIDTH; bo++)
+		{
+			const int i = (ao * SPLAT_WIDTH + bo);
+			const int3 ijk = ijkMin +
+				(DispatchThreadId.z == 0 ? int3(0, ao, bo) : (DispatchThreadId.z == 1 ? int3(ao, 0, bo) : int3(ao, bo, 0)));
+
+			if (C_Weight[i])
+			{
+				if (DispatchThreadId.z == 0)
+				{
+					NvInterlockedAddFp32(OutVelocity, ijk, C_Velocity[i]);
+					NvInterlockedAddFp32(OutWeight, ijk, C_Weight[i]);
+				}
+				else if (DispatchThreadId.z == 1)
+				{
+					NvInterlockedAddFp32(OutVelocityV, ijk, C_Velocity[i]);
+					NvInterlockedAddFp32(OutWeightV, ijk, C_Weight[i]);
+				}
+				else
+				{
+					NvInterlockedAddFp32(OutVelocityW, ijk, C_Velocity[i]);
+					NvInterlockedAddFp32(OutWeightW, ijk, C_Weight[i]);
+				}
+			}
+		}
+	}
+#endif // 0 or 1 to bypass or not
+}

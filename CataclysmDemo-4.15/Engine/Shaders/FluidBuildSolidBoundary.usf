@@ -1,0 +1,35 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidBuildSolidBoundary.usf: Shader fills the resources needed for the solid boundary conditions.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+#include "GlobalDistanceFieldShared.usf"
+
+RWTexture3D<float> OutSolidBoundary;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void BuildSolidBoundary( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint3 ijk = GetActiveIndex(DispatchThreadId);
+	float DistanceToNearestSurface;
+	[branch]
+	if (
+		ijk.x == 0 || ijk.x == (DOMAIN_SIZE_X - 1) ||
+		ijk.y == 0 || ijk.y == (DOMAIN_SIZE_Y - 1) ||
+		ijk.z == 0 || ijk.z == (DOMAIN_SIZE_Z - 1))
+	{
+		DistanceToNearestSurface = -0.5;
+	}
+	else
+	{
+		// output solid boundary
+		// get the world position of voxel center.
+		float3 NodePosition = VoxelToWorld(ijk);
+		// note  DomainVoxelInfo.WorldToVoxel.w is 1/VoxelWidth
+		DistanceToNearestSurface = GetDistanceToNearestSurfaceGlobal(NodePosition) * DomainVoxelInfo.WorldToVoxel.w; //scale back to voxel
+	}
+	OutSolidBoundary[ijk] = DistanceToNearestSurface + SURFACE_LEVELSET_AT;
+}

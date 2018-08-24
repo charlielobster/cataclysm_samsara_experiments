@@ -1,0 +1,136 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidComputeVelocityWeights.usf Compute the weights for variational solid boundary conditions
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> InSolidBoundary;// nodal not cell centered.
+
+RWTexture3D<uint> OutWeights;
+
+//Given four signed distance values (square corners, bottom top left right), determine what fraction of the square is "inside"
+float FractionInside(float bl, float br, float tl, float tr)
+{
+	uint blIn = (bl < 0 ? 1 : 0);
+	uint brIn = (br < 0 ? 1 : 0);
+	uint tlIn = (tl < 0 ? 1 : 0);
+	uint trIn = (tr < 0 ? 1 : 0);
+	uint InCount = blIn + brIn + tlIn + trIn;
+	float4 list = float4(bl, br, tr, tl);
+	float frac = 0;
+	if (InCount == 4)
+	{
+		frac = 1;
+	}
+	else if (InCount == 0)
+	{
+		frac = 0;
+	}
+	else if (InCount == 1)
+	{
+		//rotate until the negative value is in the first position
+		while (list.x >= 0)
+		{
+			list = list.yzwx;
+		}
+
+		//Work out the area of the interior triangle
+		float side0 = FractionInside(list.x, list.w);
+		float side1 = FractionInside(list.x, list.y);
+		frac = 0.5f*side0*side1;
+	}
+	else if (InCount == 2)
+	{
+		//rotate until a negative value is in the first position, and the next negative is in either slot 1 or 2.
+		while (list.x >= 0 || !(list.y < 0 || list.z < 0))
+		{
+			list = list.yzwx;
+		}
+
+		if (list.y < 0)
+		{
+			//the matching signs are adjacent
+			float side_left = FractionInside(list.x, list.w);
+			float side_right = FractionInside(list.y, list.z);
+			frac = 0.5f*(side_left + side_right);
+		}
+		else
+		{
+			//matching signs are diagonally opposite
+			//determine the centre point's sign to disambiguate this case
+			float middle_point = 0.25f*(list.x + list.y + list.z + list.w);
+			if (middle_point < 0)
+			{
+				float area = 0;
+
+				//first triangle (top left)
+				float side1 = 1 - FractionInside(list.x, list.w);
+				float side3 = 1 - FractionInside(list.z, list.w);
+
+				area += 0.5f*side1*side3;
+
+				//second triangle (top right)
+				float side2 = 1 - FractionInside(list.z, list.y);
+				float side0 = 1 - FractionInside(list.x, list.y);
+				area += 0.5f*side0*side2;
+
+				frac = 1 - area;
+			}
+			else
+			{
+				float area = 0;
+
+				//first triangle (bottom left)
+				float side0 = FractionInside(list.x, list.y);
+				float side1 = FractionInside(list.x, list.w);
+				area += 0.5f*side0*side1;
+
+				//second triangle (top right)
+				float side2 = FractionInside(list.z, list.y);
+				float side3 = FractionInside(list.z, list.w);
+				area += 0.5f*side2*side3;
+				frac = area;
+			}
+
+		}
+	}
+	else if (InCount == 3)
+	{
+		//rotate until the positive value is in the first position
+		while (list.x < 0)
+		{
+			list = list.yzwx;
+		}
+
+		//Work out the area of the exterior triangle
+		float side0 = 1 - FractionInside(list.x, list.w);
+		float side1 = 1 - FractionInside(list.x, list.y);
+		frac = 1 - 0.5f*side0*side1;
+	}
+
+	return clamp(frac, 0, 1);
+}
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void ComputeVelocityWeights(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 ijk = GetActiveIndex(DispatchThreadId);
+	
+	const float s000 = InSolidBoundary[ijk + uint3(0, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float s001 = InSolidBoundary[ijk + uint3(0, 0, 1)] - SURFACE_LEVELSET_AT;
+	const float s010 = InSolidBoundary[ijk + uint3(0, 1, 0)] - SURFACE_LEVELSET_AT;
+	const float s011 = InSolidBoundary[ijk + uint3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+	const float s100 = InSolidBoundary[ijk + uint3(1, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float s101 = InSolidBoundary[ijk + uint3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+	const float s110 = InSolidBoundary[ijk + uint3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+	const float s111 = InSolidBoundary[ijk + uint3(1, 1, 1)] - SURFACE_LEVELSET_AT;
+
+	uint Weight_x = 1023.0f*(1.0f - FractionInside(s000, s010, s001, s011));
+	uint Weight_y = 1023.0f*(1.0f - FractionInside(s000, s001, s100, s101));
+	uint Weight_z = 1023.0f*(1.0f - FractionInside(s000, s010, s100, s110));
+
+	OutWeights[ijk] = (Weight_x << 20) | (Weight_y << 10) | Weight_z;
+}

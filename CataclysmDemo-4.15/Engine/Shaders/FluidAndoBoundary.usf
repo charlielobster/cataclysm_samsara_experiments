@@ -1,0 +1,52 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidAndoBoundary.usf Equation (5) in ando
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> InSmoothDensity;
+
+RWTexture3D<float> OutLiquidBoundary;
+
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void AndoBoundary(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 ijk = GetActiveIndex(DispatchThreadId);
+	const float SurfaceAtDensity = max(0.001, abs(DomainVoxelInfo.SurfaceAtDensity));
+
+	float ls = 0;// alpha_N_rho;
+	float wtc = SurfaceAtDensity - InSmoothDensity[ijk + int3(0, 0, 0)];
+	float wtl = SurfaceAtDensity - InSmoothDensity[ijk + int3(-1, 0, 0)];
+	float wtr = SurfaceAtDensity - InSmoothDensity[ijk + int3( 1, 0, 0)];
+	float wtd = SurfaceAtDensity - InSmoothDensity[ijk + int3(0, -1, 0)];
+	float wtu = SurfaceAtDensity - InSmoothDensity[ijk + int3(0,  1, 0)];
+	float wtb = SurfaceAtDensity - InSmoothDensity[ijk + int3(0, 0, -1)];
+	float wtf = SurfaceAtDensity - InSmoothDensity[ijk + int3(0, 0,  1)];
+	if (wtc < 0)
+	{
+		float dist = min(FractionInside(wtc, wtl), FractionInside(wtc, wtr));
+		dist = min(dist, FractionInside(wtc, wtd));
+		dist = min(dist, FractionInside(wtc, wtu));
+		dist = min(dist, FractionInside(wtc, wtb));
+		dist = min(dist, FractionInside(wtc, wtf));
+		//if (dist > SQRT_OF_3_OVER_2) dist = SQRT_OF_3_OVER_2;
+		ls = -dist;
+	}
+	else
+	{
+		float dist = min(FractionInside(-wtc, -wtl), FractionInside(-wtc, -wtr));
+		dist = min(dist, FractionInside(-wtc, -wtd));
+		dist = min(dist, FractionInside(-wtc, -wtu));
+		dist = min(dist, FractionInside(-wtc, -wtb));
+		dist = min(dist, FractionInside(-wtc, -wtf));
+		//if (dist > SQRT_OF_3_OVER_2) dist = SQRT_OF_3_OVER_2;
+		ls = dist;
+
+	}
+
+	OutLiquidBoundary[ijk] = ls + SURFACE_LEVELSET_AT;
+}

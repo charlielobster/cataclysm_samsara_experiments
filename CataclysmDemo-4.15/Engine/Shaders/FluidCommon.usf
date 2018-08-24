@@ -1,0 +1,170 @@
+
+#include "FluidCommonDefines.usf"
+
+StructuredBuffer<uint> ActiveBricksList;
+
+float3 GetLiquidFractions(uint InWts)
+{
+	float3 fWts = float3((InWts >> 20) & 0x3ff, (InWts >> 10) & 0x3ff, InWts & 0x3ff);
+	fWts /= 1023.0f;
+	return fWts;
+}
+
+void UnpackWeights(float2 Parms,
+	out float lfl, out float lfr, out float lfd, out float lfu, out float lfb, out float lff)
+{
+	uint uWeights = asuint(Parms.x);
+	uint uWeightsOff = asuint(Parms.y);
+	const float3 Weights000 = GetLiquidFractions(uWeights);
+	const float3 WeightsOff = GetLiquidFractions(uWeightsOff);
+	lfl = Weights000.x;
+	lfd = Weights000.y;
+	lfb = Weights000.z;
+	lfr = WeightsOff.x;
+	lfu = WeightsOff.y;
+	lff = WeightsOff.z;
+}
+
+float3 GetLiquidFractions(uint wx, uint wy, uint wz)
+{
+	float3 fWts = float3((wx >> 20) & 0x3ff, (wy >> 10) & 0x3ff, wz & 0x3ff);
+	fWts /= 1023.0f;
+	return fWts;
+}
+
+float3 WorldToVoxel(float3 WorldPos)
+{
+	return WorldPos*DomainVoxelInfo.WorldToVoxel.w + DomainVoxelInfo.WorldToVoxel.xyz;
+}
+
+float3 VoxelToWorld(float3 VoxelPos)
+{
+	return DomainVoxelInfo.VoxelWidth*(VoxelPos - DomainVoxelInfo.WorldToVoxel.xyz);
+}
+
+uint3 PosInVoxToVoxelCoord(float3 PosInVox)
+{
+	uint3 VoxelCoord = int3(floor(PosInVox));
+	return VoxelCoord;
+}
+
+uint3 IdxToVoxelAddress(uint VoxIdx)
+{
+	// assumes 2048x2048x1024 at the largest
+	return uint3((VoxIdx >> 21) & 0x07ff, (VoxIdx >> 10) & 0x07ff, VoxIdx & 0x03ff);
+}
+
+uint AddressToVoxelIdx(uint3 ijk)
+{
+	// assumes 2048x2048x1024 at the largest
+	return uint((ijk.x << 21) | (ijk.y << 10) | ijk.z);
+}
+
+uint4 IdxToFaceAddress(uint FaceIdx)
+{
+	// assumes 1024x1024x512 at the largest, and 3 bits for face valid flag.  4 U, 2 V, 1 W
+	return uint4((FaceIdx >> 22) & 0x03ff, (FaceIdx >> 12) & 0x03ff, (FaceIdx >> 3) & 0x01ff, FaceIdx & 0x07);
+}
+
+uint AddressToFaceIdx(uint4 ijk_valid)
+{
+	// assumes 1024x1024x512 at the largest, and 3 bits for face valid flag.  4 U, 2 V, 1 W
+	return uint((ijk_valid.x << 22) | (ijk_valid.y << 12) | (ijk_valid.z << 3) | ijk_valid.w);
+}
+
+struct SprayParticleCreatePointData
+{
+	float4 position;
+	float4 velocity;
+};
+
+// Assumes the treads go over (NumBricks*BRICK_SIZE_X, BRICK_SIZE_Y, BRICK_SIZE_Z)
+// looks up the corect active brick, and uses it's address and the ThreadId to get the voxel location
+uint3 GetActiveIndex(uint3 ThreadId)
+{
+	// optimize this.
+	uint brickIdx = ActiveBricksList[ThreadId.x >> BRICK_SIZE_BITS_X];
+	uint3 ijk = uint3(BRICK_SIZE_MASK_X & ThreadId.x, ThreadId.y, ThreadId.z);
+	ijk.x |= (brickIdx & BRICK_IDX_MASK_X) << BRICK_SIZE_BITS_X;
+	ijk.y |= ((brickIdx >> BRICK_IDX_BITS_X) & BRICK_IDX_MASK_Y) << BRICK_SIZE_BITS_Y;
+	ijk.z |= ((brickIdx >> (BRICK_IDX_BITS_Y + BRICK_IDX_BITS_X)) & BRICK_IDX_MASK_Z) << BRICK_SIZE_BITS_Z;
+	return ijk;
+}
+
+#if LS_MULTIPLIER == 2
+// Assumes the treads go over (NumBricks*2*BRICK_SIZE_X, 2*BRICK_SIZE_Y, 2*BRICK_SIZE_Z)
+// looks up the corect active brick, and uses it's address and the ThreadId to get the levelset voxel location
+uint3 GetActiveIndexLS(uint3 ThreadId)
+{
+
+	uint3 BrickAddress = uint3(ThreadId.x >> 1, ThreadId.y >> 1, ThreadId.z >> 1);
+	uint3 ijk = GetActiveIndex(BrickAddress);
+	ijk = uint3((ijk.x << 1) | (ThreadId.x & 0x01), (ijk.y << 1) | (ThreadId.y & 0x01), (ijk.z << 1) | (ThreadId.z & 0x01));
+	return ijk;
+}
+#else
+// we only support the multiplier being 2 or 1
+uint3 GetActiveIndexLS(uint3 ThreadId)
+{
+	return GetActiveIndex(ThreadId);
+}
+#endif
+
+// assume left is negative, right is positive, and we don't want smaller than 0.01f
+float FractionInsideFast(float left, float right)
+{
+	return min(max(0.01f, left / (left - right)), 1);
+}
+
+float FractionInside(float left, float right)
+{
+	uint LeftIn = (left < 0 ? 1 : 0);
+	uint RightIn = (right < 0 ? 1 : 0);
+
+	float frac = (LeftIn && RightIn) ? 1 : (!LeftIn && !RightIn) ? 0 : LeftIn ? left / (left - right) : right / (right - left);
+	return clamp(frac, 0, 1);
+}
+
+void ComputeVelocityG(float3 Velocity, out float3x3 G)
+{
+
+	float3 v = SurfaceSculpting.StretchInputScale*Velocity;///TODO make parameter
+	float s = length(v);
+	if (s > 0.01)
+	{
+		v /= s;
+	}
+	else
+	{
+		G = float3x3(
+			1, 0, 0,
+			0, 1, 0,
+			0, 0, 1);
+		return;
+	}
+	const float maxS = pow(SurfaceSculpting.StretchMax, 1.0f / 3.0f) - 1;// cbrt(maxStreth) - 1, maxStretch defaults to 4
+	const float gain = SurfaceSculpting.StretchGain;
+	s = min(maxS, s*gain);
+
+	float e12 = 1.0 + s;
+	float e0 = 1.0 / (e12*e12);
+
+	// find two vectors orthogonal to v
+	float3 v1 = cross(v, float3(1, 0, 0));
+	float m = dot(v1, v1);
+	if (m < 0.01)
+	{
+		v1 = cross(v, float3(0, 1, 0));
+		m = dot(v1, v1);
+	}
+	v1 /= sqrt(m);
+	float3 v2 = cross(v, v1);
+	v2 = v2 / length(v2);
+
+	G = float3x3(
+		e0*v.x, e0*v.y, e0*v.z,
+		e12*v1.x, e12*v1.y, e12*v1.z,
+		e12*v2.x, e12*v2.y, e12*v2.z);
+	// don't really need the left rotation, it doesn't change lengths
+
+}

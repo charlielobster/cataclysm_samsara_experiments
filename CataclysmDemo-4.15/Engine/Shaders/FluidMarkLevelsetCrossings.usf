@@ -1,0 +1,382 @@
+// CATACLYSM 
+
+/*==============================================================================
+	MarkLevelsetCrossings
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> InLevelset;
+
+RWTexture3D<uint> BrickMapRW;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void MarkLevelsetCrossings(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 ijk = GetActiveIndexLS(DispatchThreadId);
+	const uint3 brick_ijk = ijk >> uint3(LS_BRICK_SIZE_BITS_X, LS_BRICK_SIZE_BITS_Y, LS_BRICK_SIZE_BITS_Z);
+#if 1
+	const float ls = InLevelset[ijk] - SURFACE_LEVELSET_AT;
+	if (abs(ls) < SQRT_OF_3) BrickMapRW[brick_ijk] = 2;
+#elif 0
+	const float ls = InLevelset[ijk] - SURFACE_LEVELSET_AT;
+	if (ls <= 0)
+	{
+		for (int i = -1; i < 2; ++i)
+		{
+			for (int j = -1; j < 2; ++j)
+			{
+				for (int k = -1; k < 2; ++k)
+				{
+					float lsAt = InLevelset[ijk + int3(i, j, k)] - SURFACE_LEVELSET_AT;
+					if (lsAt > 0)
+					{
+
+						BrickMapRW[brick_ijk] = 2;
+						return;
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		for (int i = -1; i < 2; ++i)
+		{
+			for (int j = -1; j < 2; ++j)
+			{
+				for (int k = -1; k < 2; ++k)
+				{
+					float lsAt = InLevelset[ijk + int3(i, j, k)] - SURFACE_LEVELSET_AT;
+					if (lsAt <= 0)
+					{
+						BrickMapRW[brick_ijk] = 2;
+						return;
+					}
+				}
+			}
+		}
+
+	}
+#else
+	const float LiquidSurface = InLevelset[ijk] - SURFACE_LEVELSET_AT;
+	const float ls100 = InLevelset[ijk + int3(1, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float ls010 = InLevelset[ijk + int3(0, 1, 0)] - SURFACE_LEVELSET_AT;
+	const float ls001 = InLevelset[ijk + int3(0, 0, 1)] - SURFACE_LEVELSET_AT;
+	const float lsm100 = InLevelset[ijk + int3(-1, 0, 0)] - SURFACE_LEVELSET_AT;
+	const float ls0m10 = InLevelset[ijk + int3(0, -1, 0)] - SURFACE_LEVELSET_AT;
+	const float ls00m1 = InLevelset[ijk + int3(0, 0, -1)] - SURFACE_LEVELSET_AT;
+
+	bool has_crossing = false;
+	if (LiquidSurface <= 0)
+	{
+		if (ls100 > 0 || ls010 > 0 || ls001 > 0 || lsm100 > 0 || ls0m10 > 0 || ls00m1 > 0)
+		{
+			has_crossing = true;
+		}
+	}
+	else
+	{
+		if (ls100 <= 0 || ls010 <= 0 || ls001 <= 0 || lsm100 <= 0 || ls0m10 <= 0 || ls00m1 <= 0)
+		{
+			has_crossing = true;
+		}
+	}
+	if (has_crossing)
+	{
+		BrickMapRW[brick_ijk] = 2;
+	}
+	else
+	{
+		// check edge cases
+		const uint3 at1 = uint3(
+			(ijk.x ^ (LS_BRICK_SIZE_X - 1)) == 0, 
+			(ijk.y ^ (LS_BRICK_SIZE_Y - 1)) == 0, 
+			(ijk.z ^ (LS_BRICK_SIZE_Z - 1)) == 0);
+		const uint3 at0 = uint3(
+			(ijk.x & (LS_BRICK_SIZE_X - 1)) == 0,
+			(ijk.y & (LS_BRICK_SIZE_Y - 1)) == 0,
+			(ijk.z & (LS_BRICK_SIZE_Z - 1)) == 0);
+		bool check = false;
+		float ls0, ls1, ls2, ls3, ls4;
+		if (at1.x && at1.y && at1.z)
+		{
+			ls0 = InLevelset[ijk + int3(1, 1, 1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at1.y && at0.z)
+		{
+			ls0 = InLevelset[ijk + int3(1, 1, -1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(1, 0, -1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, 1, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at0.y && at1.z)
+		{
+			ls0 = InLevelset[ijk + int3(1, -1, 1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(1, -1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, -1, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at0.y && at0.z)
+		{
+			ls0 = InLevelset[ijk + int3(1, -1, -1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(1, -1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(1, 0, -1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, -1, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at1.y && at1.z)
+		{
+			ls0 = InLevelset[ijk + int3(-1, 1, 1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(-1, 1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at1.y && at0.z)
+		{
+			ls0 = InLevelset[ijk + int3(-1, 1, -1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(-1, 1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(-1, 0, -1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, 1, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at0.y && at1.z)
+		{
+			ls0 = InLevelset[ijk + int3(-1, -1, 1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(-1, -1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, -1, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at0.y && at0.z)
+		{
+			ls0 = InLevelset[ijk + int3(-1, -1, -1)] - SURFACE_LEVELSET_AT;
+			ls1 = InLevelset[ijk + int3(-1, -1, 0)] - SURFACE_LEVELSET_AT;
+			ls2 = InLevelset[ijk + int3(-1, 0, -1)] - SURFACE_LEVELSET_AT;
+			ls3 = InLevelset[ijk + int3(0, -1, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at1.y)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at1.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.y && at1.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at0.y)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, -1, 0)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.x && at0.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, 0, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at1.y && at0.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0, 1, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at1.y)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, 1, 0)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at1.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.y && at1.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0, -1, 1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at0.y)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, -1, 0)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.x && at0.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, 0, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+		else if (at0.y && at0.z)
+		{
+			ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0, -1, -1)] - SURFACE_LEVELSET_AT;
+			check = true;
+		}
+
+#if 0
+		if (at1.x)// on the right face?
+		{
+			if (at1.y) // on the upper face?
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+				check = true;
+				if (at1.z)
+				{
+					ls1 = InLevelset[ijk + int3(1, 1, 1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+				else if (at0.z)
+				{
+					ls1 = InLevelset[ijk + int3(1, 1,-1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(1, 0,-1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0, 1,-1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+			}
+			else if (at0.y) // on the lower face
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1,-1, 0)] - SURFACE_LEVELSET_AT;
+				check = true;
+				if (at1.z)
+				{
+					ls1 = InLevelset[ijk + int3(1,-1, 1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0,-1, 1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+				else if (at0.z)
+				{
+					ls1 = InLevelset[ijk + int3(1,-1, -1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(1, 0, -1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0,-1, -1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+			}
+			else if (at1.z) // on the near face
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			}
+			else if (at0.z) // on the far face
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(1, 0,-1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			}
+		}
+		else if (at0.x)// on the left face?
+		{
+			if (at1.y) // on the upper face?
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, 1, 0)] - SURFACE_LEVELSET_AT;
+				check = true;
+				if (at1.z)
+				{
+					ls1 = InLevelset[ijk + int3(-1, 1, 1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+				else if (at0.z)
+				{
+					ls1 = InLevelset[ijk + int3(-1, 1, -1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(-1, 0, -1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0, 1, -1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+			}
+			else if (at0.y) // on the lower face
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, -1, 0)] - SURFACE_LEVELSET_AT;
+				check = true;
+				if (at1.z)
+				{
+					ls1 = InLevelset[ijk + int3(-1, -1, 1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0, -1, 1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+				else if (at0.z)
+				{
+					ls1 = InLevelset[ijk + int3(-1, -1, -1)] - SURFACE_LEVELSET_AT;
+					ls2 = InLevelset[ijk + int3(-1, 0, -1)] - SURFACE_LEVELSET_AT;
+					ls3 = InLevelset[ijk + int3(0, -1, -1)] - SURFACE_LEVELSET_AT;
+					check = true;
+				}
+			}
+			else if (at1.z) // on the near face
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, 0, 1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			}
+			else if (at0.z) // on the far face
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(-1, 0, -1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			}
+		}
+		else if (at1.y)
+		{
+			if (at1.z)
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			} 
+			else if (at0.z)
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0, 1,-1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			}
+		}
+		else if (at0.y)
+		{
+			if (at1.z)
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0,-1, 1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			} 
+			else if (at0.z)
+			{
+				ls0 = ls1 = ls2 = ls3 = InLevelset[ijk + int3(0,-1,-1)] - SURFACE_LEVELSET_AT;
+				check = true;
+			}
+		}
+#endif
+
+		if (check)
+		{
+			if (LiquidSurface <= 0)
+			{
+				if (ls0 > 0 || ls1 > 0 || ls2 > 0 || ls3 > 0)
+				{
+					has_crossing = true;
+				}
+			}
+			else
+			{
+				if (ls0 <= 0 || ls1 <= 0 || ls2 <= 0 || ls3 <= 0)
+				{
+					has_crossing = true;
+				}
+			}
+			if (has_crossing)
+			{
+				BrickMapRW[brick_ijk] = 2;
+			}
+		}
+	}
+#endif
+}

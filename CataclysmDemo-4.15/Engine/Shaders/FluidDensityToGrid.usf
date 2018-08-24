@@ -1,0 +1,147 @@
+// CATACLYSM 
+
+/*==============================================================================
+FluidDensityToGrid.usf
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<uint> ParticleVoxels;
+StructuredBuffer<uint> InCount;
+
+//Texture3D<uint> CellStarts;
+//Texture3D<uint> CellEnds;
+
+StructuredBuffer<float4> InPosInVox;
+#if USE_ANISO
+StructuredBuffer<uint> SortedParticleIndices;
+Texture2D VelocityTexture;
+#endif
+
+#include "nvHLSLExtns.usf"
+RWTexture3D<float> OutSmoothDensity;
+
+#define UNROLL_TO MAX_SPLAT_COUNT
+#define USE_LARGE_SPLAT_RING 1
+#if USE_LARGE_SPLAT_RING
+#define SPLAT_WIDTH 5
+#else
+#define SPLAT_WIDTH 3
+#endif
+
+float P(float x)
+{
+	float returnMe = 0.0f;
+	float X = x*2.0f;
+	if (X < 1.0f)
+	{
+		returnMe = 2.0f / 3.0f + X*X*(X*0.5f - 1.0f);
+	}
+	else if (X < 2.0f)
+	{
+		X = 2.0f - X;
+		returnMe = X*X*X / 6.0f;
+	}
+	return returnMe;
+}
+float P2(float x)
+{
+	return max(0,1.0f - x*x*x);
+}
+
+[numthreads(PARTICLES_TO_GRID_THREADS, SPLAT_WIDTH, 1)]
+void DensityToGrid(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+#if 0
+	// used for old way with cell starts and ends.
+	const uint3 ijkCell = IdxToVoxelAddress(ParticleVoxels[InputIndex]);
+
+	const int ko = DispatchThreadId.y;
+
+	uint Start = CellStarts[ijkCell] - 1;
+	uint End = min(CellEnds[ijkCell] - 1, ParticleCount.ParticleCount);
+#else
+
+
+	uint FistParticleInVoxelAndNum = ParticleVoxels[InputIndex];
+	uint VoxelIndex = FistParticleInVoxelAndNum >> 10;
+	uint NumInVox = FistParticleInVoxelAndNum & 0x3ff;
+
+	const uint3 ijkCell = PosInVoxToVoxelCoord(InPosInVox[VoxelIndex].xyz);// IdxToVoxelAddress(ParticleVoxels[InputIndex]);
+
+	const int ko = DispatchThreadId.y;
+
+	uint Start = VoxelIndex;// CellStarts[ijkCell] - 1;
+	uint End = VoxelIndex + NumInVox;// min(CellEnds[ijkCell] - 1, ParticleCount.ParticleCount);
+#endif
+	if (Start >= End) return;
+#if 1 // set to 0 to bypass shader.	
+
+	const float SmoothKernelRadius = SurfaceSculpting.SmoothKernelRadius;
+	const int3 ijkMin = ijkCell - int3(SPLAT_WIDTH>>1, SPLAT_WIDTH>>1, SPLAT_WIDTH>>1);
+
+	float C_Weight[SPLAT_WIDTH*SPLAT_WIDTH];
+
+	[unroll(SPLAT_WIDTH*SPLAT_WIDTH)]
+	for (int i = 0; i < SPLAT_WIDTH*SPLAT_WIDTH; ++i)
+	{
+		C_Weight[i] = 0;
+	}
+
+	[unroll(UNROLL_TO)]
+	for (uint Index = Start; Index < End; ++Index)
+	{
+		// This uses \bar{X}
+		const float3 PositionInVoxel = InPosInVox[Index].xyz;
+#if USE_ANISO
+		const uint ParticleIndex = SortedParticleIndices[Index];
+		const int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+		const float3 ParticleVelocity = mul(0.01f, VelocityTexture.Load(ParticleTexel).xyz);// cm to m
+		float3x3 G;
+		ComputeVelocityG(ParticleVelocity, G);
+		const float determ = determinant(G);
+#endif
+
+		[unroll(SPLAT_WIDTH)]
+		for (int jo = 0; jo < SPLAT_WIDTH; jo++)
+		{
+			[unroll(SPLAT_WIDTH)]
+			for (int io = 0; io < SPLAT_WIDTH; io++)
+			{
+				const int i = (jo * SPLAT_WIDTH + io);
+				const int3 ijk = ijkMin + int3(io, jo, ko);
+				const float3 VoxelPosition = float3(ijk) + float3(0.5f, 0.5f, 0.5f);
+				const float3 Diff = VoxelPosition - PositionInVoxel;
+
+#if USE_ANISO
+				float Len = length(mul(G, Diff));
+				Len /= SmoothKernelRadius;
+				float weight = max(0, determ*P(Len));
+#else
+				float Len = length(Diff);
+				Len /= SmoothKernelRadius;
+				float weight = max(0, P(Len));
+#endif
+				C_Weight[i] += weight;
+			}
+		}
+	}
+
+	[unroll(SPLAT_WIDTH)]
+	for (int jo = 0; jo < SPLAT_WIDTH; jo++)
+	{
+		[unroll(SPLAT_WIDTH)]
+		for (int io = 0; io < SPLAT_WIDTH; io++)
+		{
+			const int i = (jo * SPLAT_WIDTH + io);
+			const int3 ijk = ijkMin + int3(io, jo, ko);
+
+			if (C_Weight[i]) NvInterlockedAddFp32(OutSmoothDensity, ijk, C_Weight[i]);
+		}
+	}
+#endif // 0 or 1 to bypass or not
+}

@@ -1,0 +1,694 @@
+#include "Common.usf"
+#include "nvHLSLExtns.usf"
+
+#define GET_GROUP_IDX groupIdx.x
+#define GET_LOCAL_IDX localIdx.x
+#define GET_GLOBAL_IDX globalIdx.x
+#define GROUP_LDS_BARRIER GroupMemoryBarrierWithGroupSync()
+#define GROUP_MEM_FENCE
+#define DEFAULT_ARGS uint3 globalIdx : SV_DispatchThreadID, uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID
+
+
+// Radix sort resource bindings
+StructuredBuffer<uint> gSrc;
+StructuredBuffer<uint> gSrcVal;
+StructuredBuffer<uint> histogramIn;
+
+RWStructuredBuffer<uint> gDst;
+RWStructuredBuffer<uint> gDstVal;
+RWStructuredBuffer<uint> histogramOut;
+
+
+#define LOG2_WARP_SIZE		5
+#define WARP_SIZE			(1U << LOG2_WARP_SIZE)
+
+//assuming that the number of warps per block is less or equal to 32
+#define MAX_WARPS_PER_BLOCK	32
+
+#define KEY_BITS_PER_STEP	4
+#define KEY_DIGITS_PER_STEP	(1U << KEY_BITS_PER_STEP)
+
+#define OUT_OF_RANGE_KEY	0x7FFFFFFFu
+
+#define WarpsPerBlock		16
+#define VectorSize			4
+
+#define BlockSize			(WarpsPerBlock << LOG2_WARP_SIZE)
+#define WarpStride			(WarpsPerBlock + 1) // +1 here is to avoid shared memory bank conflicts
+
+#define Log2ElemsPerThread	2
+#define ElemsPerThread		4
+
+#define Log2DataWarpSize	(LOG2_WARP_SIZE + Log2ElemsPerThread)
+#define DataWarpSize		(1 << Log2DataWarpSize)
+
+#define clampShift(x)		min(x, 31)
+
+uint clamp(int x)
+{
+	if (x < 0) return 0;
+	if (x > 31) return 31;
+	return x;
+}
+
+#define clampShiftSign(x)	clamp(x)
+
+
+//temp shared memory for scan
+groupshared uint sdata[BlockSize * 2];
+groupshared uint sWarpCounters[KEY_DIGITS_PER_STEP * WarpStride + 1]; // +1 here is to store total scan at the end
+
+#define USE_ORIGINAL_CODE_PATH	0
+
+
+//--------------------------------------------------------------------------------------------------
+uint reduceWarp(uint val)
+{
+	val += NvShflXor(val, 0x10);
+	val += NvShflXor(val, 0x08);
+	val += NvShflXor(val, 0x04);
+	val += NvShflXor(val, 0x02);
+	val += NvShflXor(val, 0x01);
+
+	return val;
+}
+
+void processReduce(const uint warpIdx, const uint idxInWarp, const uint accum[KEY_DIGITS_PER_STEP])
+{
+	uint result = 0;
+
+	[unroll]
+	for (uint keyDigit = 0; keyDigit < KEY_DIGITS_PER_STEP; ++keyDigit)
+	{
+		uint val = accum[keyDigit];
+
+		uint res = reduceWarp(val);
+
+		if (idxInWarp == 0)
+			sWarpCounters[keyDigit * WarpStride + warpIdx] = res;
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+[numthreads((WarpsPerBlock << LOG2_WARP_SIZE), 1, 1)]
+void StreamCountKernel(DEFAULT_ARGS)
+{
+	const uint count = RadixSortInfo.ElemCount;
+	const uint gridDim = RadixSortInfo.GridDim;
+	const uint startBit = RadixSortInfo.StartBit;
+	const uint blockIdx = groupIdx.x;
+
+	const uint GridDataWarpsCount = ((count + DataWarpSize - 1) >> Log2DataWarpSize);
+	const uint DataWarpsResidue = (GridDataWarpsCount % gridDim);
+	const uint DataWarpsExtra = (blockIdx < DataWarpsResidue) ? 1 : 0;
+	const uint DataWarpsCount = (GridDataWarpsCount / gridDim) + DataWarpsExtra;
+	const uint DataWarpsOffset = blockIdx * DataWarpsCount + DataWarpsResidue * (1 - DataWarpsExtra);
+
+	const uint idx = localIdx.x;
+	const uint warpIdx = (idx >> LOG2_WARP_SIZE);
+	const uint idxInWarp = idx & (WARP_SIZE - 1);
+
+	uint accum[KEY_DIGITS_PER_STEP];
+	[unroll]
+	for (uint i = 0; i < KEY_DIGITS_PER_STEP; ++i)
+	{
+		accum[i] = 0;
+	}
+
+	uint blockPos = (DataWarpsOffset << LOG2_WARP_SIZE);
+	for (int remainWarps = DataWarpsCount; remainWarps > 0; remainWarps -= WarpsPerBlock, blockPos += BlockSize)
+	{
+		if (warpIdx < remainWarps)
+		{
+			uint inpPos = (blockPos + idx) << Log2ElemsPerThread;
+
+#if USE_ORIGINAL_CODE_PATH
+			if ((inpPos + ElemsPerThread) < count)
+			{
+				[unroll]
+				for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+				{
+					const uint key = gSrc[inpPos];
+					const uint keyDigit = ((key >> startBit) & (KEY_DIGITS_PER_STEP - 1));
+					++accum[keyDigit];
+				}
+			}
+			else
+			{
+				[unroll]
+				for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+				{
+					if (inpPos < count)
+					{
+						const uint key = gSrc[inpPos];
+						const uint keyDigit = ((key >> startBit) & (KEY_DIGITS_PER_STEP - 1));
+						++accum[keyDigit];
+					}
+				}
+			}
+#else
+			{
+				[unroll]
+				for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+				{
+					if (inpPos < count)
+					{
+						const uint key = gSrc[inpPos];
+						const uint keyDigit = ((key >> startBit) & (KEY_DIGITS_PER_STEP - 1));
+						++accum[keyDigit];
+					}
+				}
+			}
+#endif
+		}
+	}
+
+	processReduce(warpIdx, idxInWarp, accum);
+	GroupMemoryBarrierWithGroupSync();
+
+#if (WarpsPerBlock == 16)
+	const uint digit = warpIdx;
+#else
+	[unroll]
+	for (uint digit = warpIdx; digit < KEY_DIGITS_PER_STEP; digit += WarpsPerBlock)
+#endif
+	{
+		uint val = (idxInWarp < WarpsPerBlock) ? sWarpCounters[digit * WarpStride + idxInWarp] : 0;
+		uint res = reduceWarp(val);
+
+		if (idxInWarp == 0)
+		{
+			histogramOut[gridDim * digit + blockIdx] = res;
+		}
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+uint scanWarp(const uint lane, uint val)
+{
+	[unroll]
+	for (int i = 1; i < WARP_SIZE; i *= 2)
+	{
+		uint n = NvShflUp(val, i);
+		if (lane >= i) val += n;
+	}
+
+	return val;
+}
+
+groupshared uint sScanForWarp[MAX_WARPS_PER_BLOCK];
+
+uint4 scan4(const uint idx, const uint warpIdx, const uint idxInWarp, const uint scanCount, const uint4 idata)
+{
+	const uint scanWarps = (scanCount + WARP_SIZE - 1) >> LOG2_WARP_SIZE;
+
+	uint4 val4 = idata;
+	uint res = 0;
+	uint sum[3];
+
+	if (warpIdx < scanWarps)
+	{
+		sum[0] = val4.x;
+		sum[1] = val4.y + sum[0];
+		sum[2] = val4.z + sum[1];
+
+		uint val = val4.w + sum[2];
+		res = scanWarp(idxInWarp, val);
+
+		if (idxInWarp == WARP_SIZE - 1)
+		{
+			sScanForWarp[warpIdx] = res;
+		}
+		res -= val; // make scan exclusive
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// 1 warp scan
+	if (idx < WARP_SIZE)
+	{
+		uint warpScanVal = (idx < scanWarps) ? sScanForWarp[idx] : 0;
+		uint warpScanRes = scanWarp(idx, warpScanVal);
+
+		warpScanRes -= warpScanVal; // make scan exclusive
+		sScanForWarp[idx] = warpScanRes;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (warpIdx < scanWarps)
+	{
+		res += sScanForWarp[warpIdx];
+		val4.x = res;
+		val4.y = res + sum[0];
+		val4.z = res + sum[1];
+		val4.w = res + sum[2];
+	}
+
+	return val4;
+}
+
+//--------------------------------------------------------------------------------------------------
+[numthreads((WarpsPerBlock << LOG2_WARP_SIZE), 1, 1)]
+void PrefixScanKernel(DEFAULT_ARGS)
+{
+	const uint count = RadixSortInfo.ElemCount;
+	const uint blockCount = RadixSortInfo.GridDim;
+
+	const uint idx = localIdx.x;
+	const uint warpIdx = (idx >> LOG2_WARP_SIZE);
+	const uint idxInWarp = idx & (WARP_SIZE - 1);
+
+	const uint ScanCount = ((blockCount * KEY_DIGITS_PER_STEP) >> 2);
+
+	uint offset = idx << Log2ElemsPerThread;
+	uint4 val = (idx < ScanCount) ? uint4(histogramOut[offset], histogramOut[offset + 1], histogramOut[offset + 2], histogramOut[offset + 3]) : uint4(0, 0, 0, 0);
+
+	val = scan4(idx, warpIdx, idxInWarp, ScanCount, val);
+
+	if (idx < ScanCount)
+	{
+		histogramOut[offset + 0] = min(val.x, count);
+		histogramOut[offset + 1] = min(val.y, count);
+		histogramOut[offset + 2] = min(val.z, count);
+		histogramOut[offset + 3] = min(val.w, count);
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+#define BlockDataSize	(WarpsPerBlock << Log2DataWarpSize)
+
+groupshared uint sCounters[KEY_DIGITS_PER_STEP];
+groupshared uint sKeys[BlockDataSize];
+groupshared uint sValues[BlockDataSize];
+
+void readKeyAndValue(const uint idx, const uint warpIdx, const uint count, inout uint key[VectorSize], inout uint value[VectorSize], const uint remainWarps, const uint blockPos, const bool FullBlock)
+{
+	if (FullBlock || warpIdx < remainWarps)
+	{
+		uint inpPos = (blockPos + idx) << Log2ElemsPerThread;
+
+#if USE_ORIGINAL_CODE_PATH
+		if (FullBlock || (inpPos + ElemsPerThread) < count)
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+			{
+				key[i] = gSrc[inpPos];
+				value[i] = gSrcVal[inpPos];
+			}
+		}
+		else
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+			{
+				if (inpPos < count)
+				{
+					key[i] = gSrc[inpPos];
+					value[i] = gSrcVal[inpPos];
+				}
+				else
+				{
+					key[i] = OUT_OF_RANGE_KEY;
+				}
+			}
+		}
+#else
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+			{
+				if (FullBlock || inpPos < count)
+				{
+					key[i] = gSrc[inpPos];
+					value[i] = gSrcVal[inpPos];
+				}
+				else
+				{
+					key[i] = OUT_OF_RANGE_KEY;
+				}
+			}
+		}
+#endif
+	}
+}
+
+uint scanWarpWithTotal(const uint lane, uint val, inout uint total)
+{
+	[unroll]
+	for (int i = 1; i < WARP_SIZE; i *= 2)
+	{
+		uint n = NvShflUp(val, i);
+		if (lane >= i) val += n;
+	}
+	total = NvShfl(val, WARP_SIZE - 1);
+
+	return val;
+}
+
+void scanBlockInSMem(const uint idx, const uint warpIdx, const uint idxInWarp, const uint scanCount)
+{
+	const uint scanWarps = (scanCount + WARP_SIZE - 1) >> LOG2_WARP_SIZE;
+
+	uint scanRes = 0;
+
+	if (warpIdx < scanWarps)
+	{
+		uint scanVal = (idx < scanCount) ? sWarpCounters[idx] : 0;
+		scanRes = scanWarp(idxInWarp, scanVal);
+
+		if (idxInWarp == WARP_SIZE - 1)
+		{
+			sScanForWarp[warpIdx] = scanRes;
+		}
+		scanRes -= scanVal; // make scan exclusive
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// 1 warp scan
+	if (idx < WARP_SIZE)
+	{
+		uint warpScanVal = (idx < scanWarps) ? sScanForWarp[idx] : 0;
+		uint warpScanRes = scanWarp(idx, warpScanVal);
+
+		if (idxInWarp == WARP_SIZE - 1)
+		{
+			// store total scan at the end of scanArray
+			sWarpCounters[scanCount] = warpScanRes;
+		}
+		warpScanRes -= warpScanVal; // make scan exclusive
+		sScanForWarp[idx] = warpScanRes;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (idx < scanCount)
+	{
+		sWarpCounters[idx] = scanRes + sScanForWarp[warpIdx];
+	}
+	GroupMemoryBarrierWithGroupSync();
+}
+
+void localSortStep(const uint idx, const uint warpIdx, const uint idxInWarp,
+	const uint count, const uint startBit, const uint key[VectorSize], const uint value[VectorSize],
+	const uint remainWarps, const bool FullBlock, const uint blockPos)
+{
+	if (!(FullBlock || warpIdx < remainWarps))
+	{
+		// fill gaps for unused warps in sWarpCounters with 0 for correct scan later
+		if (idxInWarp < KEY_DIGITS_PER_STEP)
+		{
+			sWarpCounters[idxInWarp * WarpStride + warpIdx] = 0;
+		}
+	}
+
+	// fill gaps out of warps in sWarpCounters with 0 for correct scan later
+	if (WarpStride > WarpsPerBlock && idx < KEY_DIGITS_PER_STEP)
+	{
+		sWarpCounters[idx * WarpStride + WarpsPerBlock] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint keyDigit[ElemsPerThread];
+	uint keyOffset[ElemsPerThread];
+
+	if (FullBlock || warpIdx < remainWarps)
+	{
+		[unroll]
+		for (int i = 0; i < ElemsPerThread; ++i)
+		{
+			keyDigit[i] = ((key[i] >> startBit) & (KEY_DIGITS_PER_STEP - 1));
+			keyOffset[i] = 0;
+		}
+
+		[unroll]
+		for (uint bit = 0; bit < KEY_DIGITS_PER_STEP; bit += 4)
+		{
+			// seq. reduce
+			uint scanVal = 0;
+
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i)
+			{
+				// scanVal += (1u << clampShift((keyDigit[i] - bit) << 3)); //in PTX shifts are clamped to 32, so it's ok here
+				uint doShift = keyDigit[i] - bit;
+				if (doShift < 4)
+					scanVal += (1u << (doShift << 3));
+			}
+
+			uint scanTotal;
+			uint scanRes = scanWarpWithTotal(idxInWarp, scanVal, scanTotal);
+
+			if (idxInWarp < 4)
+			{
+				sWarpCounters[(bit + idxInWarp) * WarpStride + warpIdx] = ((scanTotal >> (idxInWarp << 3)) & 0xFF);
+			}
+			scanRes -= scanVal; // makes scan exclusive
+
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i)
+			{
+				// keyOffset[i] |= ((scanRes >> clampShift((keyDigit[i] - bit) << 3)) & 0xFF); //in PTX shifts are clamped to 32, so it's ok here
+				uint doShift = keyDigit[i] - bit;
+				if (doShift < 4)
+					keyOffset[i] |= ((scanRes >> (doShift << 3)) & 0xFF);
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+#if 0
+	uint inpPos = (blockPos + idx) << Log2ElemsPerThread;
+	for (int i = 0; i < ElemsPerThread; ++i)
+	{
+		gDst[inpPos + i] = keyOffset[i];
+	}
+	GroupMemoryBarrierWithGroupSync();
+#endif
+
+	const uint scanCount = KEY_DIGITS_PER_STEP * WarpStride;
+	scanBlockInSMem(idx, warpIdx, idxInWarp, scanCount);
+
+	if (FullBlock || warpIdx < remainWarps)
+	{
+		uint keyOffsetForWarp;
+		if (idxInWarp < KEY_DIGITS_PER_STEP)
+			keyOffsetForWarp = sWarpCounters[idxInWarp * WarpStride + warpIdx];
+
+		// seq. exclusive scan
+		const uint AccumCount = (KEY_DIGITS_PER_STEP / 16);
+		uint accum[AccumCount];
+		[unroll]
+		for (int k = 0; k < AccumCount; ++k)
+			accum[k] = 0;
+
+		[unroll]
+		for (int i = 0; i < ElemsPerThread; ++i)
+		{
+			uint digit = keyDigit[i];
+
+			uint keyLocalOffset = keyOffset[i];
+			[unroll]
+			for (uint k = 0; k < AccumCount; ++k)
+			{
+				// keyLocalOffset += ((accum[k] >> clampShift((digit - k * 16) << 1)) & 3);
+				const uint doShift = (digit - k * 16) << 1;
+				if (doShift < 32)
+					keyLocalOffset += ((accum[k] >> doShift) & 3);
+			}
+
+			keyLocalOffset += NvShfl(keyOffsetForWarp, digit);
+
+			sKeys[keyLocalOffset] = key[i];
+			sValues[keyLocalOffset] = value[i];
+
+			[unroll]
+			for (uint k = 0; k < AccumCount; ++k)
+			{
+				// accum[k] += (1u << clampShift((digit - k * 16) << 1));
+				const uint doShift = (digit - k * 16) << 1;
+				if (doShift < 32)
+					accum[k] += (1u << doShift);
+			}
+		}
+	}
+	// GroupMemoryBarrierWithGroupSync();
+}
+
+groupshared int sGlobalOffsets[KEY_DIGITS_PER_STEP];
+
+void localSortStepBlock(const uint idx, const uint warpIdx, const uint idxInWarp,
+	const uint count, const uint startBit,
+	const uint remainDataCount, const uint blockPos, const bool FullBlock)
+{
+	uint remainWarps = (remainDataCount + (DataWarpSize - 1)) >> Log2DataWarpSize;
+
+	uint key[ElemsPerThread];
+	uint value[ElemsPerThread];
+
+	readKeyAndValue(idx, warpIdx, count, key, value, remainWarps, blockPos, FullBlock);
+
+	localSortStep(idx, warpIdx, idxInWarp, count, startBit, key, value, remainWarps, FullBlock, blockPos);
+
+	if (idx < KEY_DIGITS_PER_STEP)
+	{
+		uint radixStart = sWarpCounters[idx * WarpStride];
+		uint radixEnd = sWarpCounters[(idx + 1) * WarpStride];
+
+		sGlobalOffsets[idx] = sCounters[idx] - radixStart;
+		sCounters[idx] += (radixEnd - radixStart);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	for (int outIdx = idx; outIdx < remainDataCount; outIdx += BlockSize)
+	{
+		uint _key = sKeys[outIdx];
+		uint _value = sValues[outIdx];
+		uint digit = ((_key >> startBit) & (KEY_DIGITS_PER_STEP - 1));
+
+		int globalOffset = sGlobalOffsets[digit];
+
+		uint outPos = globalOffset + outIdx;
+		gDst[outPos] = _key;
+		gDstVal[outPos] = _value;
+	}
+
+	/*
+	GroupMemoryBarrierWithGroupSync();
+	uint inpPos = (blockPos + idx) << Log2ElemsPerThread;
+	for (int i = 0; i < ElemsPerThread; ++i)
+	{
+	gDst[inpPos + i] = key[i];
+	}
+	*/
+}
+
+//--------------------------------------------------------------------------------------------------
+[numthreads((WarpsPerBlock << LOG2_WARP_SIZE), 1, 1)]
+void SortAndScatterKeyValueKernel(DEFAULT_ARGS)
+{
+	const uint count = RadixSortInfo.ElemCount;
+	const uint gridDim = RadixSortInfo.GridDim;
+	const uint startBit = RadixSortInfo.StartBit;
+	const uint blockIdx = groupIdx.x;
+
+	const uint GridDataWarpsCount = ((count + DataWarpSize - 1) >> Log2DataWarpSize);
+	const uint DataWarpsResidue = (GridDataWarpsCount % gridDim);
+	const uint DataWarpsExtra = (blockIdx < DataWarpsResidue) ? 1 : 0;
+	const uint DataWarpsCount = (GridDataWarpsCount / gridDim) + DataWarpsExtra;
+	const uint DataWarpsOffset = blockIdx * DataWarpsCount + DataWarpsResidue * (1 - DataWarpsExtra);
+
+	const uint idx = localIdx.x;
+	const uint warpIdx = (idx >> LOG2_WARP_SIZE);
+	const uint idxInWarp = idx & (WARP_SIZE - 1);
+
+	if (DataWarpsCount == 0)
+		return;
+
+	if (idx < KEY_DIGITS_PER_STEP)
+	{
+		sCounters[idx] = histogramIn[gridDim * idx + blockIdx];
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	uint blockBeg = (DataWarpsOffset << Log2DataWarpSize);
+	uint blockEnd = min(blockBeg + (DataWarpsCount << Log2DataWarpSize), count);
+	int remainDataCount = (blockEnd - blockBeg);
+
+	uint blockPos = (DataWarpsOffset << LOG2_WARP_SIZE);
+
+	for (; remainDataCount >= BlockDataSize; remainDataCount -= BlockDataSize, blockPos += BlockSize)
+	{
+		localSortStepBlock(idx, warpIdx, idxInWarp, count, startBit, BlockDataSize, blockPos, true);
+	}
+
+	if (remainDataCount > 0)
+	{
+		localSortStepBlock(idx, warpIdx, idxInWarp, count, startBit, remainDataCount, blockPos, false);
+	}
+
+	/*
+	GroupMemoryBarrierWithGroupSync();
+	if (idx < KEY_DIGITS_PER_STEP)
+	{
+	gDst[gridDim * idx + blockIdx] = rHistogram2[gridDim * idx + blockIdx];
+	}
+	*/
+}
+
+[numthreads((WarpsPerBlock << LOG2_WARP_SIZE), 1, 1)]
+void RadixSortBlock(DEFAULT_ARGS)
+{
+	const uint count = RadixSortInfo.ElemCount;
+	const uint startBit = RadixSortInfo.StartBit;
+	const uint endBit = RadixSortInfo.EndBit;
+
+	const uint DataWarpsCount = ((count + DataWarpSize - 1) >> Log2DataWarpSize);
+
+	const uint idx = localIdx.x;
+	const uint warpIdx = (idx >> LOG2_WARP_SIZE);
+	const uint idxInWarp = idx & (WARP_SIZE - 1);
+
+	// read from memory
+	uint key[ElemsPerThread];
+	uint value[ElemsPerThread];
+
+	readKeyAndValue(idx, warpIdx, count, key, value, DataWarpsCount, 0, false);
+
+	for (uint currBit = startBit; currBit < endBit; currBit += KEY_BITS_PER_STEP)
+	{
+		localSortStep(idx, warpIdx, idxInWarp, count, currBit, key, value, DataWarpsCount, false, 0);
+		GroupMemoryBarrierWithGroupSync();
+
+		if (warpIdx < DataWarpsCount)
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i)
+			{
+				key[i] = sKeys[(idx << Log2ElemsPerThread) + i];
+				value[i] = sValues[(idx << Log2ElemsPerThread) + i];
+			}
+		}
+	}
+
+	// output to memory
+	if (warpIdx < DataWarpsCount)
+	{
+		uint inpPos = idx << Log2ElemsPerThread;
+
+#if USE_ORIGINAL_CODE_PATH
+		if ((inpPos + ElemsPerThread) < count)
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+			{
+				gDst[inpPos] = key[i];
+				gDstVal[inpPos] = value[i];
+			}
+		}
+		else
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+			{
+				if (inpPos < count)
+				{
+					gDst[inpPos] = key[i];
+					gDstVal[inpPos] = value[i];
+				}
+			}
+		}
+#else
+		{
+			[unroll]
+			for (int i = 0; i < ElemsPerThread; ++i, ++inpPos)
+			{
+				if (inpPos < count)
+				{
+					gDst[inpPos] = key[i];
+					gDstVal[inpPos] = value[i];
+				}
+			}
+		}
+#endif
+	}
+}

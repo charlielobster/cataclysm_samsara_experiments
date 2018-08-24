@@ -1,0 +1,47 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidPressureJacobi.usf:  Run on even or odd set of liquid voxels.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<float4> InPressureSolverParams;
+StructuredBuffer<uint> InVoxels;
+StructuredBuffer<uint> InCount;
+
+Texture3D<float> InPressure;
+
+RWTexture3D<float> OutPressure;
+
+[numthreads(PRESSURE_SOLVE_THREADS, 1, 1)]
+void PressureJacobi( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+#if 1
+	// OutPressure and InPressureSolverParams are read with this index.
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	const uint3 ijk = IdxToVoxelAddress(InVoxels[InputIndex]);
+
+	const float4 PressureSolverParams = InPressureSolverParams[InputIndex];
+	float lfl, lfr, lfd, lfu, lfb, lff, Div, InvDiag; // liquid fraction in 6 directions, Divergence, and Inverse Diagonal.
+	UnpackWeights(PressureSolverParams.xy, lfl, lfr, lfd, lfu, lfb, lff);
+	InvDiag = PressureSolverParams.z;
+	Div = PressureSolverParams.w;
+
+	float Pressure = 0;
+
+	float OffDiag = 0;
+	if (lfl) OffDiag += -lfl*InPressure[ijk + int3(-1, 0, 0)];
+	if (lfr) OffDiag += -lfr*InPressure[ijk + int3( 1, 0, 0)];
+	if (lfd) OffDiag += -lfd*InPressure[ijk + int3(0, -1, 0)];
+	if (lfu) OffDiag += -lfu*InPressure[ijk + int3(0,  1, 0)];
+	if (lfb) OffDiag += -lfb*InPressure[ijk + int3(0, 0, -1)];
+	if (lff) OffDiag += -lff*InPressure[ijk + int3(0, 0,  1)];
+
+	Pressure = (-OffDiag + Div) * InvDiag; // Div is pre-multiplied by dx^2.
+	OutPressure[ijk] = Pressure;
+#endif
+}

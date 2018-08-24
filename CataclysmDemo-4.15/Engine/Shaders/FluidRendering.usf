@@ -1,0 +1,195 @@
+// CATACLYSM
+
+#include "Common.usf"
+#include "SHCommon.usf"
+#include "VertexFactoryCommon.usf"
+#include "ReflectionEnvironmentShared.usf"
+#include "FluidRenderingCommon.usf"
+
+
+Texture2D<float> SceneDepthCopyTexture;
+
+float FetchSceneDepth(uint2 PixelPos)
+{
+	float DeviceZ = SceneDepthCopyTexture.Load(int3(PixelPos, 0));
+
+	// Fetch the depth buffer Z / W value, solve for W
+	return ConvertFromDeviceZ(DeviceZ);
+}
+
+struct VS_Output
+{
+	float4 Position : SV_POSITION;
+	float4 VolumePos : TEXCOORD0;
+};
+
+VS_Output VSMain(float3 Pos : ATTRIBUTE0)
+{
+	VS_Output Out;
+	Out.VolumePos = float4(Pos, 1);
+	float4 WorldPos = mul(Out.VolumePos, VolumeToWorld);
+	Out.Position = mul(WorldPos, View.WorldToClip);
+	return Out;
+}
+
+float3 GetWorldPosition(float3 surfPos)
+{
+	float3 VolumePos = surfPos * float3(1.0f / R_DOMAIN_SIZE_X, 1.0f / R_DOMAIN_SIZE_Y, 1.0f / R_DOMAIN_SIZE_Z);
+	return mul(float4(VolumePos, 1), VolumeToWorld).xyz;
+}
+
+class TraceCallback : ITraceCallback
+{
+	bool bLastInside;
+	float4 lastPos;
+	bool bHasResult;
+	float MinDepth;
+
+	float WorldRayDirLen;
+	WaterShaderImpl WaterShader;
+
+	void init(float4 rayBeg, float3 rayDir, float2 ScreenUV, float2 PixelPos)
+	{
+		lastPos = rayBeg;
+		lastPos.xyz *= float3(R_DOMAIN_SIZE_X, R_DOMAIN_SIZE_Y, R_DOMAIN_SIZE_Z);
+		bLastInside = (getSurfaceValue(lastPos.xyz) < 0);
+		bHasResult = false;
+		MinDepth = -1.0f;// SceneDepth;
+
+		float3 WorldRayDir = mul(rayDir, (float3x3)VolumeToWorld);
+		WorldRayDirLen = length(WorldRayDir);
+		WorldRayDir /= WorldRayDirLen;
+
+		WaterShader.Init(WorldRayDir, ScreenUV, PixelPos);
+	}
+
+	bool LastInside() { return bLastInside; }
+	bool HasWaterShader() { return false; }
+	bool HasResult() { return bHasResult; }
+	void SetHasResult(bool hr) { bHasResult = hr; }
+	void SetLastInside(bool hr) { bLastInside = hr; }
+	void SetLastPos(float4 lp) { lastPos = lp; }
+	float4 GetLastPos() { return lastPos; }
+	float GetWorldRayDirLen() { return WorldRayDirLen; }
+	void AddFluidDist(float Distance) { }
+	void SetDepth(float Dep) { MinDepth = Dep; }
+	void SetWaterShaderDebug(float3 N) {
+		WaterShader.BlendColor = float3(0.2, 0.2, 0.2);
+		WaterShader.AddColor = float3(0, 1, 0) * DirectionalLightColor.rgb * abs(dot(N, WaterShader.WorldViewDir));
+	}
+	void WaterShaderOnEnterSurface(float4 surfPos) {
+		float3 surfNorm = CalcSurfaceGrad(surfPos.xyz);
+		float3 WorldPosition = GetWorldPosition(surfPos.xyz);
+		//note: since VoxelSize is uniform in world space normal is correct!
+		float3 WorldNormal = normalize(surfNorm);
+
+		WaterShader.OnEnterSurface(WorldNormal, WorldPosition, surfPos.w);
+	}
+
+	void WaterShaderOnExitSurface(float4 surfPos) {
+		float FluidDist = (surfPos.w - lastPos.w) * WorldRayDirLen;
+		WaterShader.OnExitSurface((lastPos.xyz + surfPos.xyz) * 0.5f, FluidDist);
+	}
+
+	bool onIntersect(float4 surfPos, float f0, float f1)
+	{
+#if DEBUG_MODE
+		float3 surfNorm = CalcSurfaceGrad(surfPos.xyz);
+		//note: since VoxelSize is uniform in world space normal is correct!
+		float3 N = normalize(surfNorm);
+
+		WaterShader.BlendColor = float3(0.2, 0.2, 0.2);
+		WaterShader.AddColor = float3(0, 1, 0) * DirectionalLightColor.rgb * abs(dot(N, WaterShader.WorldViewDir));
+
+		bHasResult = true;
+		return true; /* true = stop tracing! */
+#else
+		//if (sign(f0 - f1) < 0)
+		if (bLastInside)
+		{//trace out of water volume
+			float FluidDist = (surfPos.w - lastPos.w) * WorldRayDirLen;
+
+			WaterShader.OnExitSurface((lastPos.xyz + surfPos.xyz) * 0.5f, FluidDist);
+
+			bLastInside = false;
+		}
+		else
+		{//trace into water volume
+			float3 surfNorm = CalcSurfaceGrad(surfPos.xyz);
+			float3 WorldPosition = GetWorldPosition(surfPos.xyz);
+			//note: since VoxelSize is uniform in world space normal is correct!
+			float3 WorldNormal = normalize(surfNorm);
+
+			WaterShader.OnEnterSurface(WorldNormal, WorldPosition, surfPos.w);
+
+			bLastInside = true;
+			if (!bHasResult)
+			{
+				MinDepth = surfPos.w;
+			}
+		}
+		lastPos = surfPos;
+
+		bHasResult = true;
+		return false; /* false = continue tracing! */
+#endif
+	}
+
+	void finish(float4 rayEnd)
+	{
+		if (bLastInside)
+		{
+			rayEnd.xyz *= float3(R_DOMAIN_SIZE_X, R_DOMAIN_SIZE_Y, R_DOMAIN_SIZE_Z);
+			onIntersect(rayEnd, 0, 0);
+		}
+	}
+};
+
+
+void PSMain(VS_Output In, out float3 OutColor : SV_Target0, out float OutDepth : SV_Depth)
+{
+#if 0
+	float2 ScreenPos = ((In.Position.xy - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw - 0.5) * float2(2, -2);
+	float2 ScreenUV = (ScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz);
+
+	//float SDepth = CalcSceneDepth(ScreenUV);
+	float SDepth = FetchSceneDepth(uint2(In.Position.xy));
+	float SDepth0 = CalcSceneDepth(ScreenUV);
+
+	float Diff = abs(SDepth - SDepth0);
+
+	//float Depth = FluidDepthTexture.SampleLevel(FluidDepthTextureSampler, ScreenUV, 0).x;
+	//OutColor = Depth < SDepth ? float3(0, frac(Depth / 10000.0f), 0) : float3(0, 0, frac(SDepth / 10000.0f));
+	OutColor = SDepth < 1e10 ? float3(Diff * 10000, frac(SDepth / 10000.0f), 0) : float3(1, 0, 1);
+	OutDepth = ConvertToDeviceZ(SDepth);
+#else
+	float3 rayDir;
+	float4 rayBeg, rayEnd;
+
+	float2 ScreenPos = ((In.Position.xy - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw - 0.5) * float2(2, -2);
+	float2 ScreenUV = (ScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz);
+
+	float SceneDepth = FetchSceneDepth(uint2(In.Position.xy));
+
+	if (getCameraRay(In.Position, In.VolumePos, SceneDepth, rayDir, rayBeg, rayEnd))
+	{
+		TraceCallback callback;
+		callback.init(rayBeg, rayDir, ScreenUV, In.Position.xy);
+
+		traceGrid(callback, rayBeg, rayEnd, rayDir);
+
+		callback.finish(rayEnd);
+
+		if (callback.bHasResult)
+		{
+			OutColor = callback.WaterShader.GetFinalColor();
+			//OutDepth = ConvertToDeviceZ(min(callback.MinDepth + ScreenDepthOffset, SceneDepth));
+			//OutDepth = ConvertToDeviceZ(callback.MinDepth + ScreenDepthOffset);
+			OutDepth = (callback.MinDepth >= 0.0f) ? ConvertToDeviceZ(callback.MinDepth + ScreenDepthOffset) : 0.0f;
+			return;
+		}
+	}
+	discard;
+	OutDepth = 0.0f; //far
+#endif
+}

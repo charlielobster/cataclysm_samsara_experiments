@@ -1,0 +1,33 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidAddSkirt.usf: Add a skirt to the brick map and make the indices for the bicks with particles.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommonDefines.usf"
+
+StructuredBuffer<uint> BricksWithParticles;
+StructuredBuffer<uint> InCount;
+
+//RWTexture3D<uint> BrickIndices;
+RWTexture3D<uint> BrickMap;
+
+[numthreads(32, 27, 1)]
+void AddSkirt( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	uint brickIdx = BricksWithParticles[InputIndex];
+	//	uint outIndex = BRICK_IDX_MASK & ((((ijk.z << BRICK_IDX_BITS_Y) | ijk.y) << BRICK_IDX_BITS_X) | ijk.x);
+	uint3 ijk;
+	ijk.x = brickIdx & BRICK_IDX_MASK_X;
+	ijk.y = (brickIdx >> BRICK_IDX_BITS_X) & BRICK_IDX_MASK_Y;
+	ijk.z = (brickIdx >> (BRICK_IDX_BITS_Y + BRICK_IDX_BITS_X)) & BRICK_IDX_MASK_Z;
+	
+	int3 ijkSkirt = ijk - int3(1, 1, 1) + int3(DispatchThreadId.y / 9, (DispatchThreadId.y / 3) % 3, DispatchThreadId.y % 3);
+
+	if (ijkSkirt.x < 0 || ijkSkirt.y < 0 || ijkSkirt.z < 0 || ijkSkirt.x >= NUM_BRICKS_X || ijkSkirt.y >= NUM_BRICKS_Y || ijkSkirt.z >= NUM_BRICKS_Z) return;
+	BrickMap[ijkSkirt] = 1;
+}

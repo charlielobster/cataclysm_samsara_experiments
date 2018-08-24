@@ -1,0 +1,55 @@
+
+#include "FluidCommonDefines.usf"
+
+// return the distance to the nearest field in voxel width if we are close, and velocity to if we are inside.
+float GetFluidVelocityFieldDistance(float3 PositionInVoxel, out float4 VelocityAndWeight, out uint OutFieldIndex, out uint OutFlags)
+{
+	const float3 PositionInWorld = VoxelToWorld(PositionInVoxel);
+	float Distance = (BRICK_SIZE_X) * SQRT_OF_3;
+	VelocityAndWeight = 0;
+	OutFieldIndex = -1;
+	OutFlags = 0;
+	for (uint FieldIndex = 0; FieldIndex < FluidFields.Count; ++FieldIndex)
+	{
+		if (FluidFields.VelocityAndWeight[FieldIndex].w <= 0) continue; // don't put velocity where none was splatted in the first place.
+		float3 VolumePosition = mul(float4(PositionInWorld.xyz, 1), FluidFields.WorldToVolume[FieldIndex]).xyz;
+		float3 Size = FluidFields.VolumeSize[FieldIndex] * 0.5f;
+
+		float3 Overlap = step(-Size, VolumePosition) * step(VolumePosition, Size);
+		if (Overlap.x * Overlap.y * Overlap.z > 0)
+		{
+			// particle is inside the volume
+			float3 nearestPointOnFaceXY = mul(float4(VolumePosition.x, VolumePosition.y, VolumePosition.z < 0 ? -Size.z : Size.z, 1), FluidFields.VolumeToWorld[FieldIndex]).xyz;
+			float3 nearestPointOnFaceYZ = mul(float4(VolumePosition.x < 0 ? -Size.x : Size.x, VolumePosition.y, VolumePosition.z, 1), FluidFields.VolumeToWorld[FieldIndex]).xyz;
+			float3 nearestPointOnFaceXZ = mul(float4(VolumePosition.x, VolumePosition.y < 0 ? -Size.y : Size.y, VolumePosition.z, 1), FluidFields.VolumeToWorld[FieldIndex]).xyz;
+
+			float3 NearestXYInVoxel = WorldToVoxel(nearestPointOnFaceXY);
+			float3 NearestYZInVoxel = WorldToVoxel(nearestPointOnFaceYZ);
+			float3 NearestXZInVoxel = WorldToVoxel(nearestPointOnFaceXZ);
+
+			Distance = -min(distance(NearestXYInVoxel, PositionInVoxel), min(distance(NearestYZInVoxel, PositionInVoxel), distance(NearestXZInVoxel, PositionInVoxel)));
+			VelocityAndWeight = FluidFields.VelocityAndWeight[FieldIndex];
+			OutFieldIndex = FieldIndex;
+			OutFlags = FluidFields.RegionFlags[FieldIndex];
+			return Distance;
+		}
+		else
+		{
+			// ParticleIsOutside the voxel
+			// find the nearest point on the box.
+			float3 NearestPoint = clamp(VolumePosition, -Size, Size);
+			float3 NearestInWorld = mul(float4(NearestPoint, 1), FluidFields.VolumeToWorld[FieldIndex]).xyz;
+			float3 NearestInVoxel = WorldToVoxel(NearestInWorld);
+			float DistanceToField = distance(NearestInVoxel, PositionInVoxel);
+			if (DistanceToField < Distance)
+			{
+				Distance = DistanceToField;
+				VelocityAndWeight = FluidFields.VelocityAndWeight[FieldIndex];
+				OutFieldIndex = FieldIndex;
+				OutFlags = FluidFields.RegionFlags[FieldIndex];
+			}
+		}
+	}
+
+	return Distance;
+}

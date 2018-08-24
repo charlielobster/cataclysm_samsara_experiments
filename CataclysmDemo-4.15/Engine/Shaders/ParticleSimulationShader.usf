@@ -1,0 +1,1330 @@
+// Copyright 1998-2017 Epic Games, Inc. All Rights Reserved.
+
+/*==============================================================================
+	ParticleSimulationShader.usf: Shaders for simulating particles on the GPU.
+==============================================================================*/
+
+#include "Common.usf"
+// BEGIN CATACLYSM
+#if PARTICLE_POSITION_SIMULATION_PIXELSHADER || PARTICLE_FOAM_SIMULATION_PIXELSHADER
+	#include "FluidCommon.usf"
+#endif
+// END CATACLYSM
+
+#if DISTANCE_FIELD_COLLISION
+	#include "GlobalDistanceFieldShared.usf"
+#endif
+
+#define IMPROVED_DEPTH_BUFFER_COLLISION 1
+#define FORWARD_SHADING_ACCURATE_NORMAL 1
+
+/*------------------------------------------------------------------------------
+	Shared declarations and functions.
+------------------------------------------------------------------------------*/
+
+struct FShaderInterpolants
+{
+	/** The texture coordinate at which to sample. */
+	float2 TexCoord : TEXCOORD0;
+};
+
+/*------------------------------------------------------------------------------
+	Vertex shader.
+
+	Compile time parameters:
+		TILE_SIZE_X - The width of a particle tile in the texture.
+		TILE_SIZE_Y - The height of a particle tile in the texture.
+------------------------------------------------------------------------------*/
+#if VERTEXSHADER
+
+struct FVertexInput
+{
+	/** Unique vertex ID. */
+	uint VertexId	: SV_VertexID;
+	/** Unique instance ID. */
+	uint InstanceId	: SV_InstanceID;
+	/** The texture coordinate. */
+	float2 TexCoord	: ATTRIBUTE0;
+};
+
+/** Buffer from which to read tile offsets. */
+Buffer<float2> TileOffsets;
+
+void VertexMain(
+	in FVertexInput Input,
+	out FShaderInterpolants Interpolants,
+	out float4 OutPosition : SV_POSITION
+	)
+{
+	uint InstanceId = Input.InstanceId * TILES_PER_INSTANCE + Input.VertexId / 4;
+	
+float2 TileCoord = Input.TexCoord.xy * float2(TILE_SIZE_X,TILE_SIZE_Y) + TileOffsets[InstanceId];
+
+	OutPosition = float4(
+		TileCoord.xy * float2(2.0f,-2.0f) + float2(-1.0f,1.0f),
+		0,
+		1
+		);
+	Interpolants.TexCoord.xy = TileCoord.xy;
+}
+
+#endif // #if VERTEXSHADER
+
+/*------------------------------------------------------------------------------
+	Particle simulation pixel shader.
+------------------------------------------------------------------------------*/
+// BEGIN CATACLYSM
+#if PARTICLE_SIMULATION_PIXELSHADER || PARTICLE_VELOCITY_SIMULATION_PIXELSHADER || PARTICLE_POSITION_SIMULATION_PIXELSHADER || PARTICLE_FOAM_SIMULATION_PIXELSHADER
+
+// CATACLYSM TODO -- Sort out what attributes we need for which shader.
+// END CATACLYSM
+/** Define to 1 to force no collision in the shader. */
+#define FORCE_NO_COLLISION 0
+
+#if FORCE_NO_COLLISION || FEATURE_LEVEL < FEATURE_LEVEL_SM4
+	#undef DEPTH_BUFFER_COLLISION
+	#define DEPTH_BUFFER_COLLISION 0
+	#undef DISTANCE_FIELD_COLLISION
+	#define DISTANCE_FIELD_COLLISION 0
+#endif
+
+/** Position (XYZ) and squared radius (W) of the point attractor. */
+float4 PointAttractor;
+/** Position offset (XYZ) to add to particles and strength of the attractor (W). */
+float4 PositionOffsetAndAttractorStrength;
+/** Amount by which to scale bounds for collision purposes. */
+float2 LocalToWorldScale;
+/** Amount of time by which to simulate particles. */
+float DeltaSeconds;
+/** Number of iterations, each applying DeltaSeconds. */ 
+int	NumIterations;
+
+/** Texture from which to read particle position. */
+Texture2D PositionTexture;
+SamplerState PositionTextureSampler;
+
+/** Texture from which to read particle velocity. */
+Texture2D VelocityTexture;
+SamplerState VelocityTextureSampler;
+// BEGIN CATACLYSM
+/** CATACLYSM Texture from which to read particle FLIP velocity. */
+Texture2D FLIPVelocityTexture;
+SamplerState FLIPVelocityTextureSampler;
+// END CATACLYSM
+/** Texture from which to read particle attributes. */
+Texture2D AttributesTexture;
+SamplerState AttributesTextureSampler;
+/** Texture from which curves can be sampled. */
+Texture2D CurveTexture;
+SamplerState CurveTextureSampler;
+
+/** Textures from which to sample vector forces. */
+#if MAX_VECTOR_FIELDS != 4
+#error This must match MAX_VECTOR_FIELDS in C++ land
+#endif
+Texture3D VectorFieldTextures0;
+Texture3D VectorFieldTextures1;
+Texture3D VectorFieldTextures2;
+Texture3D VectorFieldTextures3;
+//Texture3D VectorFieldTextures4;
+//Texture3D VectorFieldTextures5;
+//Texture3D VectorFieldTextures6;
+//Texture3D VectorFieldTextures7;
+//Texture3D VectorFieldTextures8;
+//Texture3D VectorFieldTextures9;
+
+SamplerState VectorFieldTexturesSampler0;
+SamplerState VectorFieldTexturesSampler1;
+SamplerState VectorFieldTexturesSampler2;
+SamplerState VectorFieldTexturesSampler3;
+//SamplerState VectorFieldTexturesSampler4;
+//SamplerState VectorFieldTexturesSampler5;
+//SamplerState VectorFieldTexturesSampler6;
+//SamplerState VectorFieldTexturesSampler7;
+//SamplerState VectorFieldTexturesSampler8;
+//SamplerState VectorFieldTexturesSampler9;
+
+#if !PARTICLE_VELOCITY_SIMULATION_PIXELSHADER /* CATACLYSM */
+/**
+ * Computes the orbit velocity to apply to the particle based on time.
+ * @param Time - The time at which to evaluate the velocity.
+ * @param RandomOrbit - Random value used to add variation to orbit.
+ */
+float3 ComputeOrbitVelocity(float Time, float RandomOrbit)
+{
+	float3 Sines, Cosines;
+
+	// Read parameters.
+	const float3 Offset = Simulation.OrbitOffsetBase.xyz + Simulation.OrbitOffsetRange.xyz * RandomOrbit;
+	const float3 Frequency = Simulation.OrbitFrequencyBase.xyz + Simulation.OrbitFrequencyRange.xyz * RandomOrbit;
+	const float3 Phase = Simulation.OrbitPhaseBase.xyz + Simulation.OrbitPhaseRange.xyz * RandomOrbit;
+
+	// Compute angles along with cos + sin of those angles.
+	const float3 Angles = Frequency.xyz * Time.xxx + Phase.xyz;
+	sincos(Angles, Sines, Cosines);
+
+	// Compute velocity required to follow orbit path.
+	return Offset.xyz * (Frequency.zxy * Cosines.zxy - Frequency.yzx * Sines.yzx);
+}
+#endif //#if !PARTICLE_VELOCITY_SIMULATION_PIXELSHADER /* CATACLYSM */
+
+/**
+ * While the VectorFieldTextures array is split into flat textures, we need a way to 
+ * sample a texture by index, this function wraps 
+ * 
+ * 	// @todo compat hack - remove this function
+ */
+ float3 SampleVectorFieldTexture(int Index, float3 UV)
+ {
+	if (Index == 0) return Texture3DSample(VectorFieldTextures0, VectorFieldTexturesSampler0, UV).xyz;
+	if (Index == 1) return Texture3DSample(VectorFieldTextures1, VectorFieldTexturesSampler1, UV).xyz;
+	if (Index == 2) return Texture3DSample(VectorFieldTextures2, VectorFieldTexturesSampler2, UV).xyz;
+	return Texture3DSample(VectorFieldTextures3, VectorFieldTexturesSampler3, UV).xyz;
+
+//	if (Index == 3) return Texture3DSample(VectorFieldTextures3, VectorFieldTexturesSampler3, UV).xyz;
+//	if (Index == 4) return Texture3DSample(VectorFieldTextures4, VectorFieldTexturesSampler4, UV).xyz;
+//	if (Index == 5) return Texture3DSample(VectorFieldTextures5, VectorFieldTexturesSampler5, UV).xyz;
+//	if (Index == 6) return Texture3DSample(VectorFieldTextures6, VectorFieldTexturesSampler6, UV).xyz;
+//	if (Index == 7) return Texture3DSample(VectorFieldTextures7, VectorFieldTexturesSampler7, UV).xyz;
+//	if (Index == 8) return Texture3DSample(VectorFieldTextures8, VectorFieldTexturesSampler8, UV).xyz;
+//	
+//	return Texture3DSample(VectorFieldTextures9, VectorFieldTexturesSampler9, UV).xyz;
+ }
+
+/**
+ * Compute the influence of vector fields on a particle at the given position.
+ * @param OutForce - Force to apply to the particle.
+ * @param OutVelocity - Direct velocity influence on the particle.
+ * @param Position - Position of the particle.
+ * @param PerParticleScale - Amount by which to scale the influence on this particle.
+ */
+void EvaluateVectorFields(out float3 OutForce, out float4 OutVelocity, float3 Position, float PerParticleScale)
+{
+	float3 TotalForce = 0;
+	float3 WeightedVelocity = 0;
+	float TotalWeight = 0;
+	float FinalWeight = 0;
+
+	for (int VectorFieldIndex = 0; VectorFieldIndex < VectorFields.Count; ++VectorFieldIndex)
+	{
+		float2 IntensityAndTightness = VectorFields.IntensityAndTightness[VectorFieldIndex].xy;
+		float Intensity = IntensityAndTightness.x * PerParticleScale;
+		float Tightness = IntensityAndTightness.y;
+		float3 VolumeSize = VectorFields.VolumeSize[VectorFieldIndex].xyz;
+		float3 VolumeUV = mul(float4(Position.xyz,1), VectorFields.WorldToVolume[VectorFieldIndex]).xyz;
+		//Tile the UVs if needed. TilingAxes will be 1.0 or 0.0 in each channel depending on which axes are being tiled, if any.
+		VolumeUV -= floor(VolumeUV * VectorFields.TilingAxes[VectorFieldIndex].xyz);
+
+		float3 AxisWeights = 
+			saturate(VolumeUV * VolumeSize.xyz) *
+			saturate((1.0f - VolumeUV) * VolumeSize.xyz);
+		float DistanceWeight = min(AxisWeights.x, min(AxisWeights.y, AxisWeights.z));
+
+		// @todo compat hack: Some compilers only allow constant indexing into a texture array
+//		float3 VectorSample = Texture3DSample(VectorFieldTextures[VectorFieldIndex], VectorFieldTexturesSampler, saturate(VolumeUV)).xyz;
+		float3 VectorSample = SampleVectorFieldTexture(VectorFieldIndex, saturate(VolumeUV));
+
+		float3 Vec = mul(float4(VectorSample,0), VectorFields.VolumeToWorld[VectorFieldIndex]).xyz;
+		TotalForce += (Vec * DistanceWeight * Intensity);
+		WeightedVelocity += (Vec * Intensity * DistanceWeight * Tightness);
+		TotalWeight += (DistanceWeight * Tightness);
+		FinalWeight = max(FinalWeight, DistanceWeight * Tightness);
+	}
+
+	// Forces are additive.
+	OutForce = TotalForce;
+	// Velocities use a weighted average.
+	OutVelocity.xyz = WeightedVelocity / (TotalWeight + 0.001f);
+	OutVelocity.w = FinalWeight;
+}
+
+/**
+ * Compute the force due to drag.
+ * @param Velocity - Velocity of the particle.
+ * @param DragCoefficient - Coefficient of drag to apply to the particle.
+ */
+float3 ComputeDrag(float3 Velocity, float DragCoefficient)
+{
+	return -DragCoefficient * Velocity;
+}
+
+/**
+ * Compute the force on the particle due to a point of attraction.
+ * @param Position - The position of the particle.
+ */
+float3 ComputeAttractionForce(float3 Position)
+{
+	float3 PointLoc = PointAttractor.xyz;
+	float RadiusSq = PointAttractor.w;
+	float Strength = PositionOffsetAndAttractorStrength.w;
+
+	float3 DirectionToPoint = PointLoc - Position + float3(0, 0, 0.0001f);
+	float DistSq = max(dot(DirectionToPoint,DirectionToPoint), RadiusSq);
+	float Attraction = Strength / DistSq;
+	return Attraction * normalize(DirectionToPoint);
+}
+
+#if !PARTICLE_VELOCITY_SIMULATION_PIXELSHADER /* CATACLYSM */
+/** For retrieving the size of a particle. */
+Texture2D RenderAttributesTexture;
+SamplerState RenderAttributesTextureSampler;
+
+#if DEPTH_BUFFER_COLLISION
+#if !FORWARD_SHADING
+/** For retrieving the world-space normal. */
+Texture2D GBufferATexture;
+SamplerState GBufferATextureSampler;
+#endif
+
+/** Limits the depth bounds for which to search for a collision plane. */
+float CollisionDepthBounds;
+
+/** TODO: Should be moved to Common.usf and used globaly. */
+float3 WorldPositionFromSceneDepth(float2 ScreenPosition, float SceneDepth)
+{
+	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * SceneDepth, SceneDepth, 1), View.ScreenToWorld);
+	return HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+}
+
+float3 ComputeCollidingVelocity(
+	in float3 MidVelocity,
+	in float3 CollisionNormal,
+	in float RelativeTime,
+	in float Resilience)
+{
+	float3 PerpVelocity = dot(MidVelocity, CollisionNormal) * CollisionNormal;
+	float3 TanVelocity = MidVelocity - PerpVelocity;
+	float3 Reflection = Simulation.OneMinusFriction * TanVelocity - Resilience * PerpVelocity;
+
+	if (Simulation.CollisionRandomSpread == 0)
+	{
+		return Reflection;
+	}
+
+	float Rand0 = frac(RelativeTime * 131) * 2 * 3.1415;
+	float Rand1 = frac(RelativeTime * 937);
+	
+	float3 ReflectionLength = length(Reflection);
+	Reflection *= 1.0 / ReflectionLength;
+
+	// Spread particules uniformely through the reflection cone for View.GeneralPurposeTweak < 1.
+	float RoN = dot(Reflection, CollisionNormal);
+	float ZDistributionRange = 1 - Simulation.CollisionRandomSpread * pow(Rand1, Simulation.CollisionRandomDistribution) * (1 - sqrt(1 - RoN * RoN));
+	float TangentDistributionRange = sqrt(1 - ZDistributionRange * ZDistributionRange);
+	
+	float3 UpVector = abs(Reflection.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+	float3 ReflectionTangentX = normalize( cross( UpVector, Reflection ) );
+	float3 ReflectionTangentY = cross( Reflection, ReflectionTangentX );
+
+	return ReflectionLength * (
+		ReflectionTangentX * (cos(Rand0) * TangentDistributionRange) +
+		ReflectionTangentY * (sin(Rand0) * TangentDistributionRange) +
+		Reflection * ZDistributionRange);
+}
+
+/**
+ * Compute collision with the depth buffer.
+ */
+void CollideWithDepthBuffer(
+	out float3 NewPosition,
+	out float3 NewVelocity,
+	inout float RelativeTime,
+	in float3 InPosition,
+	in float3 InVelocity,
+	in float3 Acceleration,
+	in float CollisionRadius,
+	in float Resilience
+	)
+{
+	// Integration assuming no collision.
+	float3 MidVelocity = InVelocity.xyz + 0.5f * Acceleration;
+	float3 DeltaPosition = DeltaSeconds * MidVelocity;
+	NewPosition = InPosition.xyz + DeltaPosition;
+	NewVelocity = InVelocity.xyz + Acceleration;
+
+	// Figure out where to sample the depth buffer.
+	float3 CollisionOffset = normalize(DeltaPosition) * CollisionRadius;
+
+	float3 CollisionPosition = InPosition + CollisionOffset;
+	float4 SamplePosition = float4(CollisionPosition + View.PreViewTranslation,1);
+	float4 ClipPosition = mul(SamplePosition, View.TranslatedWorldToClip);
+	float2 ScreenPosition = ClipPosition.xy / ClipPosition.w;
+
+	// Don't try to collide if the particle falls outside the view.
+	if (all(abs(ScreenPosition.xy) <= float2(1,1)))
+	{
+		// Sample the depth buffer to get a world position near the particle.
+		float2 ScreenUV = ScreenPosition * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+		float SceneDepth = CalcSceneDepth(ScreenUV);
+		if (abs(ClipPosition.w - SceneDepth) < CollisionDepthBounds)
+		{
+#if FORWARD_SHADING_ACCURATE_NORMAL && FORWARD_SHADING
+			float SceneDepth0 = CalcSceneDepth(ScreenUV + float2(View.BufferSizeAndInvSize.z, 0.0));
+			float SceneDepth1 = CalcSceneDepth(ScreenUV + float2(0.0, View.BufferSizeAndInvSize.w));
+			// When using the forward shading, the normal of the pixel is approximated by the derivative of the world position
+			// of the pixel. But in on the visible edge this derivative can become very high, making CollisionPlane almost
+			// perpendicular to the view plane. In these case the particle may collide the visible edges of the diferent meshes
+			// in the view frustum. To avoid this, we disable the collision test if one of the derivate is above a threshold.
+			if (max(abs(SceneDepth - SceneDepth0), abs(SceneDepth - SceneDepth1)) > CollisionDepthBounds)
+			{
+				return;
+			}
+#endif
+			// Reconstruct world position.
+			float3 WorldPosition = WorldPositionFromSceneDepth(ScreenPosition.xy, SceneDepth);
+			
+#if FORWARD_SHADING && FORWARD_SHADING_ACCURATE_NORMAL
+			// Compute normal using the two additional neighbooring pixel depth buffer fetches.
+			float3 WorldPosition0 = WorldPositionFromSceneDepth(ScreenPosition.xy + float2(2 * View.ViewSizeAndInvSize.z, 0.0), SceneDepth0);
+			float3 WorldPosition1 = WorldPositionFromSceneDepth(ScreenPosition.xy - float2(0.0, 2 * View.ViewSizeAndInvSize.w), SceneDepth1);
+			float3 WorldNormal = normalize(cross(WorldPosition0 - WorldPosition, WorldPosition1 - WorldPosition));
+#elif FORWARD_SHADING // && !FORWARD_SHADING_ACCURATE_NORMAL
+			// Compute normal using a ddx/ddy hack, hopefully the neighbooring particules will be close enough...
+			float3 WorldNormal = normalize(cross(ddx(WorldPosition), ddy(WorldPosition)));
+			WorldNormal *= sign(dot(View.WorldCameraOrigin - NewPosition, WorldNormal));
+#else //!FORWARD_SHADING
+			// Sample the normal buffer to create a plane to collide against.
+			float3 WorldNormal = Texture2DSampleLevel(GBufferATexture, GBufferATextureSampler, ScreenUV, 0).xyz * 2.0 - 1.0;
+#endif
+			float4 CollisionPlane = float4(WorldNormal, dot(WorldPosition.xyz,WorldNormal));
+
+			// Compute the portion of velocity normal to the collision plane.
+			float VelocityDot = dot(CollisionPlane.xyz, DeltaPosition.xyz);
+
+
+
+#if IMPROVED_DEPTH_BUFFER_COLLISION
+			// distance to the plane from current and predicted position
+			float d_back = ( dot(CollisionPlane.xyz, InPosition.xyz)+CollisionRadius - CollisionPlane.w );
+			float d_front = ( dot(CollisionPlane.xyz, NewPosition.xyz)-CollisionRadius - CollisionPlane.w );
+
+			if (d_back >= 0.0f && d_front <= 0.0f && VelocityDot<0.0f)
+			{
+				NewVelocity = ComputeCollidingVelocity(MidVelocity, CollisionPlane.xyz, RelativeTime, Resilience);
+
+				// If the particle lies approximately on the collision plane, don't jump to the point of collision.
+				d_back *= step(VelocityDot,-1);
+
+				// Integrate position taking the collision in to account.
+				float PositionAdjustment = ( dot(CollisionPlane.xyz, InPosition.xyz)-CollisionRadius - CollisionPlane.w );
+				NewPosition = InPosition + PositionAdjustment*CollisionPlane.xyz + NewVelocity * DeltaSeconds*0.1;
+
+				// Update the relative time. Usually this does nothing, but if the
+				// user has elected to kill the particle upon collision this will do
+				// so.
+				RelativeTime += Simulation.CollisionTimeBias;
+			}
+			else if (d_front < 0.0f && d_back < 0.0f)
+			{
+				RelativeTime = 1.1f;
+			}
+#else
+			float InvVelocityDot = rcp(VelocityDot + 0.0001f); // Add a small amount to avoid division by zero.
+			// Distance to the plane from the center of the particle.
+			float DistanceToPlane = dot(CollisionPlane.xyz, InPosition.xyz) - CollisionPlane.w;
+
+			// Find out the time of intersection for both the front and back of the sphere.
+			float t_back = -(DistanceToPlane + CollisionRadius) * InvVelocityDot;
+			float t_front = -(DistanceToPlane - CollisionRadius) * InvVelocityDot;
+
+			if (step(0, t_back) * step(t_front, 1) * step(0, DistanceToPlane))
+			{
+				NewVelocity = ComputeCollidingVelocity(MidVelocity, CollisionPlane.xyz, RelativeTime, Resilience);
+
+				// If the particle lies approximately on the collision plane, don't jump to the point of collision.
+				t_front *= step(VelocityDot,-1);
+
+				// Integrate position taking the collision in to account.
+				NewPosition = InPosition + DeltaPosition * t_front + NewVelocity * (1.0f - t_front) * DeltaSeconds;
+
+				// Update the relative time. Usually this does nothing, but if the
+				// user has elected to kill the particle upon collision this will do
+				// so.
+				RelativeTime += Simulation.CollisionTimeBias;
+			}
+			//else if (t_front > 0 && t_back < 1 && DistanceToPlane < 0)
+			else if (step(0, t_front) * step(t_back, 1) * step(DistanceToPlane,0))
+			{
+				// The particle has collided against a backface, kill it by setting
+				// relative time to a value > 1.0.
+				RelativeTime = 1.1f;
+			}
+#endif
+		}
+	}
+}
+#endif // #if DEPTH_BUFFER_COLLISION
+
+#if DISTANCE_FIELD_COLLISION
+
+/**
+ * Compute collision with the global signed distance field
+ */
+/* BEGIN CATACLYSM */
+bool CollideWithDistanceField(
+	out float3 NewPosition,
+	out float3 NewVelocity,
+	inout float RelativeTime,
+	in float3 InPosition,
+	in float3 InVelocity,
+	in float3 Acceleration,
+#if PARTICLE_POSITION_SIMULATION_PIXELSHADER
+	in bool isInLiquid,
+#endif
+	in float CollisionRadius,
+	in float Resilience
+	)
+{
+#if PARTICLE_POSITION_SIMULATION_PIXELSHADER
+	// if we are in the liquid then InVelocity and Acceleration are interpreted differently.
+	float3 MidVelocity;
+	float3 DeltaPosition;
+//	if (isInLiquid)
+//	{
+//		MidVelocity = InVelocity;
+//	}
+//	else
+//	{
+		MidVelocity = InVelocity.xyz + 0.5f * Acceleration;
+//	}
+	DeltaPosition = DeltaSeconds * MidVelocity;
+	NewPosition = InPosition.xyz + DeltaPosition;
+	NewVelocity = InVelocity.xyz + Acceleration;
+#else
+	// Integration assuming no collision.
+	float3 MidVelocity = InVelocity.xyz + 0.5f * Acceleration;
+	float3 DeltaPosition = DeltaSeconds * MidVelocity;
+	NewPosition = InPosition.xyz + DeltaPosition;
+	NewVelocity = InVelocity.xyz + Acceleration;
+#endif
+/* END CATACLYSM */
+
+	float DistanceToNearestSurface = GetDistanceToNearestSurfaceGlobal(InPosition);
+	float MaxCollisionDistance = CollisionRadius + length(DeltaPosition.xyz);
+
+	if (DistanceToNearestSurface < MaxCollisionDistance)
+	{
+		float3 CollisionWorldNormal = normalize(GetDistanceFieldGradientGlobal(InPosition));
+		float3 CollisionWorldPosition = InPosition - CollisionWorldNormal * DistanceToNearestSurface;
+
+		float4 CollisionPlane = float4(CollisionWorldNormal.xyz, dot(CollisionWorldPosition.xyz, CollisionWorldNormal.xyz));
+
+		// Compute the portion of velocity normal to the collision plane.
+		float VelocityDot = dot(CollisionPlane.xyz, DeltaPosition.xyz);
+		float InvVelocityDot = rcp(VelocityDot + 0.0001f); // Add a small amount to avoid division by zero.
+
+		// Distance to the plane from the center of the particle.
+		float DistanceToPlane = dot(CollisionPlane.xyz, InPosition.xyz) - CollisionPlane.w;
+
+		// Find out the time of intersection for both the front and back of the sphere.
+		float t_back = -(DistanceToPlane + CollisionRadius) * InvVelocityDot;
+		float t_front = -(DistanceToPlane - CollisionRadius) * InvVelocityDot;
+
+		//if (t_back >= 0 && t_front <= 1 && DistanceToPlane >= 0)
+		if (step(0, t_back) * step(t_front, 1) * step(0, DistanceToPlane))
+		{
+			// Separate velocity in to the components perpendicular and tangent to the collision plane.
+			float3 PerpVelocity = dot(MidVelocity,CollisionPlane.xyz) * CollisionPlane.xyz;
+			float3 TanVelocity = MidVelocity - PerpVelocity;
+
+			// Compute the new velocity accounting for resilience and friction.
+			NewVelocity = Simulation.OneMinusFriction * TanVelocity - Resilience * PerpVelocity;
+
+			// If the particle lies approximately on the collision plane, don't jump to the point of collision.
+			t_front *= step(VelocityDot,-1);
+
+			// Integrate position taking the collision in to account.
+			NewPosition = InPosition + DeltaPosition * t_front + NewVelocity * (1.0f - t_front) * DeltaSeconds;
+
+			// Update the relative time. Usually this does nothing, but if the
+			// user has elected to kill the particle upon collision this will do
+			// so.
+			RelativeTime += Simulation.CollisionTimeBias;
+			return true; /* CATACLYSM */
+		}
+		//else if (t_front > 0 && t_back < 1 && DistanceToPlane < 0)
+		else if (step(0, t_front) * step(t_back, 1) * step(DistanceToPlane,0))
+		{
+			// The particle has collided against a backface, kill it by setting
+			// relative time to a value > 1.0.
+			RelativeTime = 1.1f;
+		}
+	}
+	return false; /* CATACLYSM */
+}
+
+#endif
+#endif //!PARTICLE_VELOCITY_SIMULATION_PIXELSHADER /* CATACLYSM */
+
+#if PARTICLE_SIMULATION_PIXELSHADER /* CATACLYSM */
+
+void PixelMain(
+	in FShaderInterpolants Interpolants,
+	out float4 OutPosition : SV_Target0,
+	out float4 OutVelocity : SV_Target1
+	)
+{
+	// Initialize force to the constant acceleration.
+	float3 Force = Simulation.Acceleration;
+
+	// Sample the current position, velocity, and attributes for this particle.
+	const float4 PositionSample = Texture2DSample(PositionTexture, PositionTextureSampler, Interpolants.TexCoord.xy);
+	const float4 VelocitySample = Texture2DSample(VelocityTexture, VelocityTextureSampler, Interpolants.TexCoord.xy );
+	const float4 InitialAttributes = Texture2DSample(AttributesTexture, AttributesTextureSampler, Interpolants.TexCoord.xy ) *
+		Simulation.AttributeScale + Simulation.AttributeBias;
+
+	// Velocity.w holds the time scale for this particle.
+	float3 Velocity = VelocitySample.xyz;
+	const float TimeScale = VelocitySample.w;
+
+	// Position.w holds the relative time of the particle.
+	float3 Position = PositionSample.xyz;
+	float RelativeTime = PositionSample.w;
+
+	for (int IterationIndex = 0; IterationIndex < NumIterations; ++IterationIndex)
+	{
+		RelativeTime += DeltaSeconds * TimeScale;
+
+		// Sample the attribute curve.
+		const float2 AttributeCurveTexCoord = Simulation.AttributeCurve.xy +
+			Simulation.AttributeCurve.zw * RelativeTime;
+		const float4 AttributeCurve = Texture2DSample(CurveTexture, CurveTextureSampler, AttributeCurveTexCoord ) *
+			Simulation.AttributeCurveScale + Simulation.AttributeCurveBias;
+
+		// Simulation attributes.
+		const float4 Attributes = InitialAttributes * AttributeCurve;
+		const float DragCoefficient = Attributes.r;
+		const float PerParticleVectorFieldScale = Attributes.g;
+		const float Resilience = Attributes.b;
+		const float OrbitRandom = Attributes.a;
+
+		// Evalute vector fields.
+		float3 FieldForce = 0;
+		float4 FieldVelocity = 0;
+		EvaluateVectorFields(FieldForce, FieldVelocity, Position.xyz, PerParticleVectorFieldScale);
+
+		// Add in force from vector fields.
+		Force += FieldForce;
+
+		// Account for direct velocity.
+		const float DirectVelocityAmount = FieldVelocity.w;
+		Velocity.xyz = lerp(Velocity.xyz, FieldVelocity.xyz, DirectVelocityAmount);
+
+		// Compute force due to drag.
+		Force += ComputeDrag(Velocity.xyz, DragCoefficient);
+
+		// Compute force to a point gravity source.
+		Force += ComputeAttractionForce(Position.xyz);
+
+		// Compute the acceleration to apply to the particle this frame.
+		float3 Acceleration = Force * DeltaSeconds;
+
+	#if DEPTH_BUFFER_COLLISION || DISTANCE_FIELD_COLLISION
+		// We need to look up render attributes for this particle to figure out how big it is.
+		float4 RenderAttributeSample = Texture2DSampleLevel(RenderAttributesTexture, RenderAttributesTextureSampler, Interpolants.TexCoord.xy, 0);
+	
+		// Sample the misc render attributes curve.
+		float2 MiscCurveTexCoord = Simulation.MiscCurve.xy + Simulation.MiscCurve.zw * RelativeTime;
+		float4 MiscCurveSample = Texture2DSampleLevel(CurveTexture, CurveTextureSampler, MiscCurveTexCoord, 0 );
+		float4 MiscCurve = MiscCurveSample * Simulation.MiscScale + Simulation.MiscBias;
+
+		// Compute the size of the sprite. Note it is (0,0) if the sprite is dead.
+		float2 InitialSize = abs(RenderAttributeSample.xy);
+		float2 SizeScale = MiscCurve.xy;
+		float2 Size = InitialSize * SizeScale * LocalToWorldScale;
+
+		// Compute the radius with which to perform collision checks.
+		float CollisionRadius = min(Size.x,Size.y) * Simulation.CollisionRadiusScale + Simulation.CollisionRadiusBias;
+	#endif
+
+		float3 NewPosition, NewVelocity;
+
+	#if DEPTH_BUFFER_COLLISION
+	
+		// Compute the new position and velocity of the particle by colliding against
+		// the scene's depth buffer.
+		CollideWithDepthBuffer(
+			NewPosition.xyz,
+			NewVelocity.xyz,
+			RelativeTime,
+			Position.xyz,
+			Velocity.xyz,
+			Acceleration,
+			CollisionRadius,
+			Resilience
+			);
+	#elif DISTANCE_FIELD_COLLISION
+
+		CollideWithDistanceField(
+			NewPosition.xyz,
+			NewVelocity.xyz,
+			RelativeTime,
+			Position.xyz,
+			Velocity.xyz,
+			Acceleration,
+			CollisionRadius,
+			Resilience
+			);
+
+	#else 
+		// Integrate position and velocity forward.
+		float3 DeltaPosition = DeltaSeconds * (Velocity.xyz + 0.5f * Acceleration);
+		NewPosition = Position.xyz + DeltaPosition;
+		NewVelocity = Velocity.xyz + Acceleration;
+	#endif
+
+		// Apply orbit.
+		const float3 OrbitVelocity = ComputeOrbitVelocity(RelativeTime, OrbitRandom);
+		NewPosition += OrbitVelocity * DeltaSeconds;
+
+		// Update values for new iteration.
+		Velocity = NewVelocity;
+		Position = NewPosition;
+	}
+
+	// Store the new position, time, and velocity for the particle.
+	OutPosition.xyz = Position + PositionOffsetAndAttractorStrength.xyz;
+	OutPosition.w = RelativeTime;
+	OutVelocity.xyz = Velocity;
+	OutVelocity.w = TimeScale;
+}
+/* BEGIN CATACLYSM */
+#endif // PARTICLE_SIMULATION_PIXELSHADER
+
+#if PARTICLE_VELOCITY_SIMULATION_PIXELSHADER
+
+void PixelMain(
+	in FShaderInterpolants Interpolants,
+	out float4 OutFLIPVelocity : SV_Target0
+	)
+{
+	// TODO we may actually want to make this update an acceleration instead of velocity, se we can 
+	// 1) save old velocity,
+	// 2) add the acceleration
+	// 3) do the fluid sim
+	// 4) 
+	// Initialize force to the constant acceleration.
+	float3 Force = Simulation.Acceleration;
+
+	// Sample the current position, velocity, and attributes for this particle.
+	const float4 PositionSample = Texture2DSample(PositionTexture, PositionTextureSampler, Interpolants.TexCoord.xy);
+	const float4 VelocitySample = Texture2DSample(VelocityTexture, VelocityTextureSampler, Interpolants.TexCoord.xy);
+	const float4 FLIPVelocitySample = Texture2DSample(FLIPVelocityTexture, FLIPVelocityTextureSampler, Interpolants.TexCoord.xy);
+	const float4 InitialAttributes = Texture2DSample(AttributesTexture, AttributesTextureSampler, Interpolants.TexCoord.xy) *
+		Simulation.AttributeScale + Simulation.AttributeBias;
+
+	// Velocity.w holds the time scale for this particle.
+	float3 Velocity = VelocitySample.xyz;
+	const float TimeScale = VelocitySample.w;
+
+	// FLIPVelocity.w holds -1 for new particle, or the count zero parameters for particle event release.
+	float3 FLIPVelocity = FLIPVelocitySample.xyz;
+	const float FLIPVelocityW = FLIPVelocitySample.w;
+
+	// Position.w holds the relative time of the particle.
+	float3 Position = PositionSample.xyz;
+	float RelativeTime = PositionSample.w + DeltaSeconds * TimeScale;
+
+	// Sample the attribute curve.
+	const float2 AttributeCurveTexCoord = Simulation.AttributeCurve.xy +
+		Simulation.AttributeCurve.zw * RelativeTime;
+	const float4 AttributeCurve = Texture2DSample(CurveTexture, CurveTextureSampler, AttributeCurveTexCoord ) *
+		Simulation.AttributeCurveScale + Simulation.AttributeCurveBias;
+
+	// Simulation attributes.
+	const float4 Attributes = InitialAttributes * AttributeCurve;
+	const float DragCoefficient = Attributes.r;
+	const float PerParticleVectorFieldScale = Attributes.g;
+	
+	// Evalute vector fields.
+	float3 FieldForce = 0;
+	float4 FieldVelocity = 0;
+	EvaluateVectorFields(FieldForce, FieldVelocity, Position.xyz, PerParticleVectorFieldScale);
+
+	// Add in force from vector fields.
+	Force += FieldForce;
+
+	// Account for direct velocity.
+	const float DirectVelocityAmount = FieldVelocity.w;
+	FLIPVelocity.xyz = lerp(FLIPVelocity.xyz, FieldVelocity.xyz, DirectVelocityAmount);
+	Velocity.xyz = lerp(Velocity.xyz, FieldVelocity.xyz, DirectVelocityAmount);
+
+	// Compute force due to drag.
+	Force += ComputeDrag(Velocity.xyz, DragCoefficient);
+
+	// Compute force to a point gravity source.
+	Force += ComputeAttractionForce(Position.xyz);
+
+	// Compute the acceleration to apply to the particle this frame.
+	float3 Acceleration = Force * DeltaSeconds;
+
+	// Integrate velocity forward.
+	float3 NewFLIPVelocity = FLIPVelocity.xyz + Acceleration;
+
+	OutFLIPVelocity.xyz = NewFLIPVelocity;
+	OutFLIPVelocity.w = FLIPVelocityW;
+}
+
+#endif // #if PARTICLE_VELOCITY_SIMULATION_PIXELSHADER
+
+#if PARTICLE_POSITION_SIMULATION_PIXELSHADER
+
+
+SamplerState LiquidSurfaceTextureSampler;
+Texture3D LiquidSurfaceTexture;
+
+SamplerState GridVelocitiesUTextureSampler;
+Texture3D GridVelocitiesUTexture;
+SamplerState GridVelocitiesVTextureSampler;
+Texture3D GridVelocitiesVTexture;
+SamplerState GridVelocitiesWTextureSampler;
+Texture3D GridVelocitiesWTexture;
+
+SamplerState PreSolveParticleVelocitiesSampler;
+Texture2D PreSolveParticleVelocities; // xyz components
+
+AppendStructuredBuffer<SprayParticleCreatePointData> OutNewSprayParticleDatasEvent1;
+AppendStructuredBuffer<SprayParticleCreatePointData> OutNewSprayParticleDatasEvent2;
+AppendStructuredBuffer<SprayParticleCreatePointData> OutNewSprayParticleDatasEvent3;
+
+bool IsInKillFluidVelocityField(float3 Position)
+{
+	for (uint FieldIndex = 0; FieldIndex < FluidFields.Count; ++FieldIndex)
+	{
+		// Must match EFluidRegionFlags::KillInside and KillOutside
+		bool KillInside = FluidFields.RegionFlags[FieldIndex] & 0x01;
+		bool KillOutside = FluidFields.RegionFlags[FieldIndex] & 0x02;
+		if (KillInside || KillOutside) 
+		{
+			float3 VolumePosition = mul(float4(Position.xyz, 1), FluidFields.WorldToVolume[FieldIndex]).xyz;
+			float3 Size = FluidFields.VolumeSize[FieldIndex] * 0.5f;
+			float3 Overlap = step(-Size, VolumePosition) * step(VolumePosition, Size);
+			if (Overlap.x * Overlap.y * Overlap.z > 0)
+			{
+				// Inside
+				if (KillInside) return true;
+			}
+			else
+			{
+				if (KillOutside) return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+float Bilerp(float v00, float v10, float v01, float v11, float fx, float fy)
+{
+	return (1 - fy)*((1 - fx)*v00 + fx*v10) + fy*((1 - fx)*v01 + fx*v11);
+}
+
+// return the levelset value and the normal at the given location
+float3 GetSurfaceNormal(float3 VoxPos)
+{
+	float3 NodPos = VoxPos - float3(0.5f, 0.5f, 0.5f);
+	int3 ijk = int3(floor(NodPos));
+	float3 frac = NodPos - ijk;
+	float ls000 = LiquidSurfaceTexture[(ijk + int3(0, 0, 0))] - SURFACE_LEVELSET_AT;
+	float ls001 = LiquidSurfaceTexture[(ijk + int3(0, 0, 1))] - SURFACE_LEVELSET_AT;
+	float ls010 = LiquidSurfaceTexture[(ijk + int3(0, 1, 0))] - SURFACE_LEVELSET_AT;
+	float ls011 = LiquidSurfaceTexture[(ijk + int3(0, 1, 1))] - SURFACE_LEVELSET_AT;
+	float ls100 = LiquidSurfaceTexture[(ijk + int3(1, 0, 0))] - SURFACE_LEVELSET_AT;
+	float ls101 = LiquidSurfaceTexture[(ijk + int3(1, 0, 1))] - SURFACE_LEVELSET_AT;
+	float ls110 = LiquidSurfaceTexture[(ijk + int3(1, 1, 0))] - SURFACE_LEVELSET_AT;
+	float ls111 = LiquidSurfaceTexture[(ijk + int3(1, 1, 1))] - SURFACE_LEVELSET_AT;
+
+//	float Surface =
+//		ls000*(1 - frac.x)*(1 - frac.y)*(1 - frac.z) +
+//		ls001*(1 - frac.x)*(1 - frac.y)*(frac.z) +
+//		ls010*(1 - frac.x)*(frac.y)*(1 - frac.z) +
+//		ls011*(1 - frac.x)*(frac.y)*(frac.z) +
+//		ls100*(frac.x)*(1 - frac.y)*(1 - frac.z) +
+//		ls101*(frac.x)*(1 - frac.y)*(frac.z) +
+//		ls110*(frac.x)*(frac.y)*(1 - frac.z) +
+//		ls111*(frac.x)*(frac.y)*(frac.z);
+
+	float ddx00 = ls100 - ls000;
+	float ddx01 = ls101 - ls001;
+	float ddx10 = ls110 - ls010;
+	float ddx11 = ls111 - ls011;
+	float dv_dx = Bilerp(ddx00, ddx10, ddx01, ddx11, frac.y, frac.z);
+
+	float ddy00 = ls010 - ls000;
+	float ddy01 = ls011 - ls001;
+	float ddy10 = ls110 - ls100;
+	float ddy11 = ls111 - ls101;
+	float dv_dy = Bilerp(ddy00, ddy10, ddy01, ddy11, frac.x, frac.z);
+
+	float ddz00 = ls001 - ls000;
+	float ddz01 = ls011 - ls010;
+	float ddz10 = ls101 - ls100;
+	float ddz11 = ls111 - ls110;
+	float dv_dz = Bilerp(ddz00, ddz10, ddz01, ddz11, frac.x, frac.y);
+
+	float3 N = float3(dv_dx, dv_dy, dv_dz);
+	float gradLen = length(N);
+	[branch]
+	if (gradLen > 1e-7) N /= gradLen;
+	else N = float3(0, 0, 1);
+
+	return N;
+}
+
+void PixelMain(
+	in FShaderInterpolants Interpolants,
+	out float4 OutPosition : SV_Target0,
+	out float4 OutVelocity : SV_Target1,
+	out float4 OutFLIPVelocity : SV_Target2
+	)
+{
+	// Initialize force to the constant acceleration.
+	float3 Force = Simulation.Acceleration;
+
+	// Sample the current position, velocity, and attributes for this particle.
+	const float4 PositionSample = Texture2DSample(PositionTexture, PositionTextureSampler, Interpolants.TexCoord.xy);
+	const float4 VelocitySample = Texture2DSample(VelocityTexture, VelocityTextureSampler, Interpolants.TexCoord.xy);
+	const float4 FLIPVelocitySample = Texture2DSample(FLIPVelocityTexture, FLIPVelocityTextureSampler, Interpolants.TexCoord.xy);
+	const float4 InitialAttributes = Texture2DSample(AttributesTexture, AttributesTextureSampler, Interpolants.TexCoord.xy ) *
+		Simulation.AttributeScale + Simulation.AttributeBias;
+
+	const float4 PreDivGridVelocity = Texture2DSample(PreSolveParticleVelocities, PreSolveParticleVelocitiesSampler, Interpolants.TexCoord.xy);
+
+	// Velocity.w holds the time scale for this particle.
+	float3 Velocity = VelocitySample.xyz;
+	const float TimeScale = VelocitySample.w;
+
+	// FLIPVelocity.w holds -1 for new particle, or the count zero parameters for particle event release.
+	float3 FLIPVelocity = FLIPVelocitySample.xyz;
+	int SprayEventCount = max(0, FLIPVelocitySample.w);
+	bool isNewParticle = (FLIPVelocitySample.w == -1);
+	// first 5 bits are the counts.
+	int3 CountZeros = int3((SprayEventCount >> 10) & 0x01f, (SprayEventCount >> 5) & 0x01f, SprayEventCount & 0x01f);
+	CountZeros = clamp(CountZeros - int3(1, 1, 1), int3(0, 0, 0), int3(31, 31, 31));
+	// Position.w holds the relative time of the particle.
+	float3 Position = PositionSample.xyz;
+	float RelativeTime = PositionSample.w + DeltaSeconds * TimeScale;
+
+	// tansform to voxel space
+	const float3 PositionInVoxel = WorldToVoxel(PositionSample.xyz);
+
+	float3 TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+
+	// Sample the attribute curve.
+	const float2 AttributeCurveTexCoord = Simulation.AttributeCurve.xy +
+		Simulation.AttributeCurve.zw * RelativeTime;
+	const float4 AttributeCurve = Texture2DSample(CurveTexture, CurveTextureSampler, AttributeCurveTexCoord) *
+		Simulation.AttributeCurveScale + Simulation.AttributeCurveBias;
+
+	// Simulation attributes.
+	const float4 Attributes = InitialAttributes * AttributeCurve;
+	const float DragCoefficient = Attributes.r;
+	const float PerParticleVectorFieldScale = Attributes.g;
+	const float Resilience = Attributes.b;
+	const float OrbitRandom = Attributes.a;
+
+	// Evalute vector fields.
+	float3 FieldForce = 0;
+	float4 FieldVelocity = 0;
+	EvaluateVectorFields(FieldForce, FieldVelocity, Position.xyz, PerParticleVectorFieldScale);
+
+	// Add in force from vector fields.
+	Force += FieldForce;
+
+	// Account for direct velocity.
+	const float DirectVelocityAmount = FieldVelocity.w;
+	Velocity.xyz = lerp(Velocity.xyz, FieldVelocity.xyz, DirectVelocityAmount);
+	FLIPVelocity.xyz = lerp(FLIPVelocity.xyz, FieldVelocity.xyz, DirectVelocityAmount);
+
+	// Compute force due to drag.
+	Force += ComputeDrag(Velocity.xyz, DragCoefficient);
+
+	// Compute force to a point gravity source.
+	const float3 attractionForce = ComputeAttractionForce(Position.xyz);
+	Force += attractionForce;
+
+	// Compute the acceleration to apply to the particle this frame.
+	float3 Acceleration = Force * DeltaSeconds;
+
+	// Integrate velocity forward.
+	FLIPVelocity.xyz += Acceleration;
+
+#if DISTANCE_FIELD_COLLISION
+	// TODO our collision radius should probably be based on half the simulation voxel size...
+	// We need to look up render attributes for this particle to figure out how big it is.
+	float4 RenderAttributeSample = Texture2DSampleLevel(RenderAttributesTexture, RenderAttributesTextureSampler, Interpolants.TexCoord.xy, 0);
+
+	// Sample the misc render attributes curve.
+	float2 MiscCurveTexCoord = Simulation.MiscCurve.xy + Simulation.MiscCurve.zw * RelativeTime;
+	float4 MiscCurveSample = Texture2DSampleLevel(CurveTexture, CurveTextureSampler, MiscCurveTexCoord, 0);
+	float4 MiscCurve = MiscCurveSample * Simulation.MiscScale + Simulation.MiscBias;
+
+	// Compute the size of the sprite. Note it is (0,0) if the sprite is dead.
+	float2 InitialSize = abs(RenderAttributeSample.xy);
+	float2 SizeScale = MiscCurve.xy;
+	float2 Size = InitialSize * SizeScale * LocalToWorldScale;
+
+	// TODO make this a fixed value based on sim parameters?
+	// Compute the radius with which to perform collision checks.
+	float CollisionRadius = min(Size.x, Size.y) * Simulation.CollisionRadiusScale + Simulation.CollisionRadiusBias;
+#endif
+
+	// Find out if the particle is in the bulk of the liquid
+	float Surface = PreDivGridVelocity.w;// Texture3DSample(LiquidSurfaceTexture, LiquidSurfaceTextureSampler, TexCoord) - SURFACE_LEVELSET_AT;
+	bool isInLiquid = Surface < 0;
+	float3 Div0GridVelocity;
+	// staggered velocity samples are on left, bottom and back faces, not center.
+
+
+#define USE_RK2 1 // TODO Make Parameter
+
+	if (isInLiquid)
+	{
+
+		Div0GridVelocity.x = Texture3DSample(GridVelocitiesUTexture, GridVelocitiesUTextureSampler, float3(TexCoord.x + 0.5f / DOMAIN_SIZE_X, TexCoord.y, TexCoord.z));
+		Div0GridVelocity.y = Texture3DSample(GridVelocitiesVTexture, GridVelocitiesVTextureSampler, float3(TexCoord.x, TexCoord.y + 0.5f / DOMAIN_SIZE_Y, TexCoord.z));
+		Div0GridVelocity.z = Texture3DSample(GridVelocitiesWTexture, GridVelocitiesWTextureSampler, float3(TexCoord.x, TexCoord.y, TexCoord.z + 0.5f / DOMAIN_SIZE_Z));
+		Velocity = Div0GridVelocity*100.0f; // grid velocities are in meters, move to cm.
+#if USE_RK2
+											// 100 is form m to cm, 0.5 is because we want the midpoint velocity.
+		const float3 MidPosition = PositionSample.xyz + (100.0f*0.5f*DeltaSeconds)*Div0GridVelocity;
+		const float3 MidPositionInVoxel = WorldToVoxel(MidPosition);
+
+		float3 MidTexCoord = MidPositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+		float3 MidDiv0GridVelocity;
+		MidDiv0GridVelocity.x = Texture3DSample(GridVelocitiesUTexture, GridVelocitiesUTextureSampler, float3(MidTexCoord.x + 0.5f / DOMAIN_SIZE_X, MidTexCoord.y, MidTexCoord.z));
+		MidDiv0GridVelocity.y = Texture3DSample(GridVelocitiesVTexture, GridVelocitiesVTextureSampler, float3(MidTexCoord.x, MidTexCoord.y + 0.5f / DOMAIN_SIZE_Y, MidTexCoord.z));
+		MidDiv0GridVelocity.z = Texture3DSample(GridVelocitiesWTexture, GridVelocitiesWTextureSampler, float3(MidTexCoord.x, MidTexCoord.y, MidTexCoord.z + 0.5f / DOMAIN_SIZE_Z));
+		Acceleration = 2.0f*(MidDiv0GridVelocity*100.0f - Velocity); // grid velocities are in meters, move to cm.
+#else
+		Acceleration = 0; // could take difference in V0 and midVel times 2...
+#endif
+	}
+
+#if DISTANCE_FIELD_COLLISION
+
+	float3 NewPosition, NewVelocity;
+	// The following is at the top of CollideWithDistanceField, to set new velocity and position.
+//	float3 MidVelocity = InVelocity.xyz + 0.5f * Acceleration;
+//	float3 DeltaPosition = DeltaSeconds * MidVelocity;
+//	NewPosition = InPosition.xyz + DeltaPosition;
+//	NewVelocity = InVelocity.xyz + Acceleration;
+	bool DidCollide = CollideWithDistanceField(
+		NewPosition.xyz,
+		NewVelocity.xyz,
+		RelativeTime,
+		Position.xyz,
+		Velocity.xyz,
+		Acceleration,
+		isInLiquid,
+		CollisionRadius,
+		Resilience
+		);
+	// how much we use of PIC or FLIP.  0 if pure FLIP, and 1 is pure PIC
+
+	const float PIC_SMOOTHING = min(1, DomainVoxelInfo.PICSmoothing);
+
+	if (DidCollide || !isInLiquid)// || PIC_SMOOTHING >= 1)
+	{
+		// FLIP velocity no longer makes sense because there was a collision, so reset it to the NewVelocity
+		FLIPVelocity = NewVelocity;
+	}
+	else
+	{
+		// did not collide, and we are in the fluid with a non zero flip multiplier.
+		FLIPVelocity += (Div0GridVelocity - PreDivGridVelocity.xyz)*100.0f;// take difference off flip velocity, and scale to cm/s
+	//	FLIPVelocity = PIC_SMOOTHING*NewVelocity + (1.0f - PIC_SMOOTHING)*FLIPVelocity;
+		FLIPVelocity = PIC_SMOOTHING*100.0f*Div0GridVelocity + (1.0f - PIC_SMOOTHING)*FLIPVelocity;
+	}
+	// Apply orbit.
+	const float3 OrbitVelocity = ComputeOrbitVelocity(RelativeTime, OrbitRandom);
+	NewPosition = NewPosition + OrbitVelocity * DeltaSeconds + PositionOffsetAndAttractorStrength.xyz;
+	const float3 NewPositionInVoxel = WorldToVoxel(NewPosition);
+
+
+	// Kill the particle if it is inside a fluid field with bKillParticles true
+	if (IsInKillFluidVelocityField(NewPosition))
+	{
+		RelativeTime = 2.0f;
+	} 
+	// Kill particles if they have moved outside the domain.
+	else if (NewPositionInVoxel.x <= 0 || NewPositionInVoxel.x >= (DOMAIN_SIZE_X) ||
+			 NewPositionInVoxel.y <= 0 || NewPositionInVoxel.y >= (DOMAIN_SIZE_Y) ||
+			 NewPositionInVoxel.z <= 0 || NewPositionInVoxel.z >= (DOMAIN_SIZE_Z))
+	{
+		// get rid of particles outside the dimain.
+		RelativeTime = 2.0f;
+	}
+	else if (RelativeTime <= 1.0f && (SprayParticleSpawnEvent1.bEnabled || SprayParticleSpawnEvent2.bEnabled || SprayParticleSpawnEvent3.bEnabled))
+	{
+		// TODO we fix slow motion by taking a longer time step, but we should make this the same no matter the fps.
+		// If the time step is too small, take an extrapolated longer step so that things work in slow motion.
+		float3 SprayGuessPositionInVoxel = NewPositionInVoxel;
+		if (DeltaSeconds < 1.0f / 30.0f)
+		{
+			float ExtrapolateDeltaSeconds = 1.0f / 30.0f - DeltaSeconds;
+			SprayGuessPositionInVoxel = WorldToVoxel(NewPosition + ExtrapolateDeltaSeconds*NewVelocity);
+
+		}
+		float3 NewTexCoord = SprayGuessPositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+		float NewSurface = Texture3DSample(LiquidSurfaceTexture, LiquidSurfaceTextureSampler, NewTexCoord) - SURFACE_LEVELSET_AT;
+		float NewVelocityLength = length(NewVelocity);
+		float DeltaDepth = NewSurface - Surface;
+		float3 SurfaceNormal = GetSurfaceNormal(NewPositionInVoxel);// @note make this SprayGuessPositionInVoxel?
+		float velDotNormal = dot(NewVelocity, SurfaceNormal);
+		// Collision Event
+		if (SprayParticleSpawnEvent1.bEnabled &&
+			!CountZeros.x &&
+			DidCollide &&
+			NewSurface > SprayParticleSpawnEvent1.MinDistanceToSurface &&
+			SurfaceNormal.z > SprayParticleSpawnEvent1.ZBias &&
+			velDotNormal >= SprayParticleSpawnEvent1.MinEscapeSpeed &&
+			1)
+		{
+			CountZeros.x = min(0x1f, SprayParticleSpawnEvent1.SpawnDelay);
+			SprayParticleCreatePointData data;
+			data.position = float4(NewPosition, 0);
+			data.velocity = float4(NewVelocity, 1);
+
+			OutNewSprayParticleDatasEvent1.Append(data);
+		}
+
+		bool DidEscape = Surface < 0 && NewSurface > 0;
+		// Escape Event
+		if (SprayParticleSpawnEvent2.bEnabled &&
+			!CountZeros.y &&
+			DidEscape &&
+			NewVelocityLength > SprayParticleSpawnEvent2.MinNewVelocityLength &&
+			1)
+		{
+			CountZeros.y = min(0x1f, SprayParticleSpawnEvent2.SpawnDelay);
+			SprayParticleCreatePointData data;
+			data.position = float4(NewPosition, 0);
+			data.velocity = float4(NewVelocity, 1);
+
+			OutNewSprayParticleDatasEvent2.Append(data);
+		}
+
+		// Splash Event
+		if (SprayParticleSpawnEvent3.bEnabled &&
+			!CountZeros.z &&
+			NewSurface > SprayParticleSpawnEvent3.MinDistanceToSurface &&
+			DeltaDepth > SprayParticleSpawnEvent3.DeltaDepth &&
+			(!DidCollide || !SprayParticleSpawnEvent3.bIgnoreCollided) &&
+			(!DidEscape || !SprayParticleSpawnEvent3.bIgnoreEscaped) &&
+			velDotNormal >= SprayParticleSpawnEvent3.MinEscapeSpeed &&
+			1)
+		{
+			CountZeros.z = min(0x1f, SprayParticleSpawnEvent3.SpawnDelay);
+			SprayParticleCreatePointData data;
+			data.position = float4(NewPosition, 0);
+			data.velocity = float4(NewVelocity, 1);
+			OutNewSprayParticleDatasEvent3.Append(data);
+		}
+	}
+
+#endif
+
+	// Store the new position, time, and velocity for the particle.
+	OutPosition.xyz = NewPosition;
+	OutPosition.w = RelativeTime;
+	OutVelocity.xyz = NewVelocity;
+	OutVelocity.w = TimeScale;
+	OutFLIPVelocity.xyz = FLIPVelocity;
+	OutFLIPVelocity.w = int((CountZeros.x & 0x1f) << 10 | (CountZeros.y & 0x1f) << 5 | (CountZeros.z & 0x1f));
+}
+#endif // PARTICLE_POSITION_SIMULATION_PIXELSHADER
+
+#if PARTICLE_FOAM_SIMULATION_PIXELSHADER
+
+SamplerState LiquidSurfaceTextureSampler;
+Texture3D LiquidSurfaceTexture;
+
+SamplerState GridVelocitiesUTextureSampler;
+Texture3D GridVelocitiesUTexture;
+SamplerState GridVelocitiesVTextureSampler;
+Texture3D GridVelocitiesVTexture;
+SamplerState GridVelocitiesWTextureSampler;
+Texture3D GridVelocitiesWTexture;
+
+StructuredBuffer<SprayParticleCreatePointData> CollisionPointsBuffer;
+
+float Bilerp(float v00, float v10, float v01, float v11, float fx, float fy)
+{
+	return (1 - fy)*((1 - fx)*v00 + fx*v10) + fy*((1 - fx)*v01 + fx*v11);
+}
+
+// return the levelset value and the normal at the given location
+float3 GetSurfaceNormal(float3 VoxPos)
+{
+	float3 NodPos = VoxPos - float3(0.5f, 0.5f, 0.5f);
+	int3 ijk = int3(floor(NodPos));
+	float3 frac = NodPos - ijk;
+	float ls000 = LiquidSurfaceTexture[(ijk + int3(0, 0, 0))] - SURFACE_LEVELSET_AT;
+	float ls001 = LiquidSurfaceTexture[(ijk + int3(0, 0, 1))] - SURFACE_LEVELSET_AT;
+	float ls010 = LiquidSurfaceTexture[(ijk + int3(0, 1, 0))] - SURFACE_LEVELSET_AT;
+	float ls011 = LiquidSurfaceTexture[(ijk + int3(0, 1, 1))] - SURFACE_LEVELSET_AT;
+	float ls100 = LiquidSurfaceTexture[(ijk + int3(1, 0, 0))] - SURFACE_LEVELSET_AT;
+	float ls101 = LiquidSurfaceTexture[(ijk + int3(1, 0, 1))] - SURFACE_LEVELSET_AT;
+	float ls110 = LiquidSurfaceTexture[(ijk + int3(1, 1, 0))] - SURFACE_LEVELSET_AT;
+	float ls111 = LiquidSurfaceTexture[(ijk + int3(1, 1, 1))] - SURFACE_LEVELSET_AT;
+
+	//	float Surface =
+	//		ls000*(1 - frac.x)*(1 - frac.y)*(1 - frac.z) +
+	//		ls001*(1 - frac.x)*(1 - frac.y)*(frac.z) +
+	//		ls010*(1 - frac.x)*(frac.y)*(1 - frac.z) +
+	//		ls011*(1 - frac.x)*(frac.y)*(frac.z) +
+	//		ls100*(frac.x)*(1 - frac.y)*(1 - frac.z) +
+	//		ls101*(frac.x)*(1 - frac.y)*(frac.z) +
+	//		ls110*(frac.x)*(frac.y)*(1 - frac.z) +
+	//		ls111*(frac.x)*(frac.y)*(frac.z);
+
+	float ddx00 = ls100 - ls000;
+	float ddx01 = ls101 - ls001;
+	float ddx10 = ls110 - ls010;
+	float ddx11 = ls111 - ls011;
+	float dv_dx = Bilerp(ddx00, ddx10, ddx01, ddx11, frac.y, frac.z);
+
+	float ddy00 = ls010 - ls000;
+	float ddy01 = ls011 - ls001;
+	float ddy10 = ls110 - ls100;
+	float ddy11 = ls111 - ls101;
+	float dv_dy = Bilerp(ddy00, ddy10, ddy01, ddy11, frac.x, frac.z);
+
+	float ddz00 = ls001 - ls000;
+	float ddz01 = ls011 - ls010;
+	float ddz10 = ls101 - ls100;
+	float ddz11 = ls111 - ls110;
+	float dv_dz = Bilerp(ddz00, ddz10, ddz01, ddz11, frac.x, frac.y);
+
+	float3 N = float3(dv_dx, dv_dy, dv_dz);
+	float gradLen = length(N);
+	if (gradLen > 1e-7) N /= gradLen;
+
+	return N;
+}
+// Move first then project onto surface, or project onto surface then move.
+#define MOVE_FIRST 1
+void PixelMain(
+	in FShaderInterpolants Interpolants,
+	out float4 OutPosition : SV_Target0,
+	out float4 OutVelocity : SV_Target1,
+	out float4 OutSurfaceNormal : SV_Target2
+	)
+{
+	// Sample the current position for this particle.
+	const float4 PositionSample = Texture2DSample(PositionTexture, PositionTextureSampler, Interpolants.TexCoord.xy);
+	const float4 VelocitySample = Texture2DSample(VelocityTexture, VelocityTextureSampler, Interpolants.TexCoord.xy);
+
+	// Velocity.w holds the time scale for this particle.
+	float3 Velocity = VelocitySample.xyz;
+	const float TimeScale = VelocitySample.w;
+
+	// Position.w holds the relative time of the particle.
+	float3 Position = PositionSample.xyz;
+	float RelativeTime = PositionSample.w + DeltaSeconds * TimeScale;
+
+	float4 NewPosition = float4(Position, RelativeTime);
+
+	float3 PositionInVoxel = WorldToVoxel(Position);
+	float3 TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+#if MOVE_FIRST
+
+	// out velocity is grid velocity, and in cm/second not m/second
+	// staggered velocity samples are on left, bottom and back faces, not center.
+	float3 SampleVelocity;
+	SampleVelocity.x = Texture3DSample(GridVelocitiesUTexture, GridVelocitiesUTextureSampler, float3(TexCoord.x + 0.5f / DOMAIN_SIZE_X, TexCoord.y, TexCoord.z))*100.0f;
+	SampleVelocity.y = Texture3DSample(GridVelocitiesVTexture, GridVelocitiesVTextureSampler, float3(TexCoord.x, TexCoord.y + 0.5f / DOMAIN_SIZE_Y, TexCoord.z))*100.0f;
+	SampleVelocity.z = Texture3DSample(GridVelocitiesWTexture, GridVelocitiesWTextureSampler, float3(TexCoord.x, TexCoord.y, TexCoord.z + 0.5f / DOMAIN_SIZE_Z))*100.0f;
+
+	NewPosition.xyz += SampleVelocity * DeltaSeconds;
+
+	PositionInVoxel = WorldToVoxel(NewPosition.xyz);
+	TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+#endif
+	
+	// Try projecting it along the normal so it sticks to the surface.
+	const float Surface = Texture3DSample(LiquidSurfaceTexture, LiquidSurfaceTextureSampler, TexCoord).x;
+	float distanceInVoxel = (Surface - SURFACE_LEVELSET_AT)/LS_MULTIPLIER - 0.02f; // TODO parameter, foam offset.
+	// we could try a few times to move the particle to the surface, but lets just move once for now...	
+	float3 n = GetSurfaceNormal(PositionInVoxel*LS_MULTIPLIER);
+	n.z = abs(n.z);
+	OutSurfaceNormal = float4(n, 1);
+	bool bParticleUsedWithCollisionEvent = false;
+	if (abs(distanceInVoxel) > 0.01f)
+	{			
+		if (any(n))
+		{		
+			PositionInVoxel = PositionInVoxel - distanceInVoxel*n;
+			NewPosition.xyz = VoxelToWorld(PositionInVoxel);
+
+			// if we moved further from the surface, delete the particle.
+			TexCoord = PositionInVoxel / float3(DOMAIN_SIZE_X, DOMAIN_SIZE_Y, DOMAIN_SIZE_Z);
+#if 0
+			float checkDistanceInVoxel = Texture3DSample(LiquidSurfaceTexture, LiquidSurfaceTextureSampler, TexCoord).x;
+			checkDistanceInVoxel = (checkDistanceInVoxel - SURFACE_LEVELSET_AT) / LS_MULTIPLIER;
+			if (abs(checkDistanceInVoxel) > 1.5f*abs(distanceInVoxel))
+			{
+				//NewPosition.w = 2.0f;
+				bParticleUsedWithCollisionEvent = true;
+			}
+#endif
+		}
+		else
+		{
+			// can't move without a normal.
+	//		NewPosition.w = 2.0f;
+			//bParticleUsedWithCollisionEvent = true;
+		}
+	}
+	// Once you are at the surface, more the particle with the surface velocity...
+#if !MOVE_FIRST
+
+	// out velocity is grid velocity, and in cm/second not m/second
+	// staggered velocity samples are on left, bottom and back faces, not center.
+	float3 SampleVelocity;
+	SampleVelocity.x = Texture3DSample(GridVelocitiesUTexture, GridVelocitiesUTextureSampler, float3(TexCoord.x + 0.5f / DOMAIN_SIZE_X, TexCoord.y, TexCoord.z))*100.0f;
+	SampleVelocity.y = Texture3DSample(GridVelocitiesVTexture, GridVelocitiesVTextureSampler, float3(TexCoord.x, TexCoord.y + 0.5f / DOMAIN_SIZE_Y, TexCoord.z))*100.0f;
+	SampleVelocity.z = Texture3DSample(GridVelocitiesWTexture, GridVelocitiesWTextureSampler, float3(TexCoord.x, TexCoord.y, TexCoord.z + 0.5f / DOMAIN_SIZE_Z))*100.0f;
+
+	NewPosition.xyz += SampleVelocity * DeltaSeconds;
+#endif
+
+	if (bParticleUsedWithCollisionEvent)
+	{
+		if (ParticleCount.ParticleCount > 0)
+		{
+			uint index = (asuint(Interpolants.TexCoord.x) + (asuint(Interpolants.TexCoord.y) << 16)) % ParticleCount.ParticleCount;
+			NewPosition.xyz = CollisionPointsBuffer[index].position + normalize(float3(CollisionPointsBuffer[index].velocity.xy, 0)) * TexCoord;
+		}		
+		else
+		{
+			NewPosition.w = 2.0f;
+		}
+	}
+	
+	OutPosition = NewPosition;
+	OutVelocity = float4(SampleVelocity, TimeScale);
+}
+#endif // PARTICLE_FOAM_SIMULATION_PIXELSHADER
+#endif // #if PARTICLE_SIMULATION_PIXELSHADER || PARTICLE_VELOCITY_SIMULATION_PIXELSHADER || PARTICLE_POSITION_SIMULATION_PIXELSHADER || PARTICLE_FOAM_SIMULATION_PIXELSHADER
+/* END CATACLYSM */
+
+/*------------------------------------------------------------------------------
+	Clear particle simulation pixel shader.
+------------------------------------------------------------------------------*/
+#if PARTICLE_CLEAR_PIXELSHADER
+
+void PixelMain(
+	in FShaderInterpolants Interpolants,
+	out float4 OutPosition : SV_Target0,
+	out float4 OutVelocity : SV_Target1
+	)
+{
+	// Relative time just needs to be >1.0f so the particle is considered dead.
+	OutPosition = float4(0,0,0,2.0f);
+	OutVelocity = float4(0,0,0,0);
+}
+
+#endif // #if PARTICLE_CLEAR_PIXELSHADER
+

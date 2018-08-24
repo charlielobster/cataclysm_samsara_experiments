@@ -1,0 +1,39 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidNormalizeVelocityAndSplatFields.usf  normalize the velocity.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+//#include "FluidGetFluidFieldDistance.usf"
+
+Texture3D<float> InSplatWeightU;
+Texture3D<float> InSplatWeightV;
+Texture3D<float> InSplatWeightW;
+
+RWTexture3D<float> OutSplatU;
+RWTexture3D<float> OutSplatV;
+RWTexture3D<float> OutSplatW;
+RWTexture3D<uint> OutValidFlags;
+
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void NormalizeVelocityAndSplatFields(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 ijk = GetActiveIndex(DispatchThreadId);
+
+	float WeightU = InSplatWeightU[ijk];
+	float WeightV = InSplatWeightV[ijk];
+	float WeightW = InSplatWeightW[ijk];
+
+	uint ValidFlags = 0;
+	if (WeightU) ValidFlags += 4;
+	if (WeightV) ValidFlags += 2;
+	if (WeightW) ValidFlags += 1;
+	OutValidFlags[ijk] = ValidFlags;
+
+	OutSplatU[ijk] = WeightU ? OutSplatU[ijk] / WeightU : 0.0f;
+	OutSplatV[ijk] = WeightV ? OutSplatV[ijk] / WeightV : 0.0f;
+	OutSplatW[ijk] = WeightW ? OutSplatW[ijk] / WeightW : 0.0f;
+}

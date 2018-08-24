@@ -1,0 +1,37 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidExtendLiquidIntoSolid.usf: Shader fills the resources needed for the solid boundary conditions.
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+Texture3D<float> InSolidBoundary;
+RWTexture3D<float> OutLiquidBoundary;
+
+[numthreads(CTA_SIZE_X, CTA_SIZE_Y, CTA_SIZE_Z)]
+void ExtendLiquidIntoSolid( uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	const uint3 ijk = GetActiveIndex(DispatchThreadId);
+	const float InLiquid = OutLiquidBoundary[ijk] - SURFACE_LEVELSET_AT;
+	float OutLiquid = InLiquid;
+	if (InLiquid > -0.5f && InLiquid < 0.5f)
+	{
+		const float s000 = InSolidBoundary[ijk + uint3(0, 0, 0)] - SURFACE_LEVELSET_AT;
+		const float s100 = InSolidBoundary[ijk + uint3(1, 0, 0)] - SURFACE_LEVELSET_AT;
+		const float s010 = InSolidBoundary[ijk + uint3(0, 1, 0)] - SURFACE_LEVELSET_AT;
+		const float s110 = InSolidBoundary[ijk + uint3(1, 1, 0)] - SURFACE_LEVELSET_AT;
+		const float s001 = InSolidBoundary[ijk + uint3(0, 0, 1)] - SURFACE_LEVELSET_AT;
+		const float s101 = InSolidBoundary[ijk + uint3(1, 0, 1)] - SURFACE_LEVELSET_AT;
+		const float s011 = InSolidBoundary[ijk + uint3(0, 1, 1)] - SURFACE_LEVELSET_AT;
+		const float s111 = InSolidBoundary[ijk + uint3(1, 1, 1)] - SURFACE_LEVELSET_AT;
+
+		const float solid_phi = s000 + s001 + s010 + s011 + s100 + s101 + s110 + s111;
+		if (solid_phi < 0)
+		{
+			OutLiquid = -0.5f;
+		}
+	}
+	OutLiquidBoundary[ijk] = OutLiquid + SURFACE_LEVELSET_AT;
+}

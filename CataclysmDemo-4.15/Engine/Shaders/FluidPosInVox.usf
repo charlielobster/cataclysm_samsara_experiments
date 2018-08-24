@@ -1,0 +1,40 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidPosInVox
+==============================================================================*/
+
+#include "Common.usf"
+#include "FluidCommon.usf"
+
+StructuredBuffer<uint> ParticleVoxels;
+StructuredBuffer<uint> InCount;
+
+StructuredBuffer<uint> SortedParticleIndices;
+Texture2D PositionTexture;
+
+RWStructuredBuffer<float4> OutPosInVox;// position in voxel and subvoxelindex.
+
+#define UNROLL_TO MAX_SPLAT_COUNT
+[numthreads(32, UNROLL_TO, 1)]
+void PosInVox(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+
+	uint InputIndex = DispatchThreadId.x;
+	if (InputIndex >= InCount[0]) return;
+
+	uint FistParticleInVoxelAndNum = ParticleVoxels[InputIndex];
+	uint FirstVoxIndex = (FistParticleInVoxelAndNum >> 10);
+	uint NumInVox = FistParticleInVoxelAndNum & 0x3ff;
+
+	[unroll(1)]
+	for (uint Offset = DispatchThreadId.y; Offset < NumInVox; Offset += UNROLL_TO)
+	{
+		uint VoxelIndex = FirstVoxIndex + Offset;
+		uint ParticleIndex = SortedParticleIndices[VoxelIndex];
+		int3 ParticleTexel = int3(ParticleIndex >> GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y, ParticleIndex & (GPU_PARTICLE_SIM_TEXTURE_SIZE_Y - 1), 0);
+		float4 WorldPosition = PositionTexture.Load(ParticleTexel);
+		float3 PositionInVoxel = WorldToVoxel(WorldPosition.xyz);
+		OutPosInVox[VoxelIndex] = float4(PositionInVoxel, 1);
+	}
+}

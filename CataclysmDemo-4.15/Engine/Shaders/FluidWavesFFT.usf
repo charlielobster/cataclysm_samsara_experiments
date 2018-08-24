@@ -1,0 +1,157 @@
+// CATACLYSM 
+
+/*==============================================================================
+	FluidWavesFFT
+==============================================================================*/
+
+#include "Common.usf"
+
+#define FFT_COUNT 1
+#define FFT_USE_LERP 0
+
+Texture2D<float4> InSpectrum;
+Texture2D<float4> InTexture;
+RWTexture2D<float4> OutTexture;
+
+
+#ifndef PI
+#define PI (3.1415926535897932f)
+#endif
+
+uint2 FFT_Tangling(uint2 Pos, uint Bits)
+{
+	return reversebits(Pos) >> (32 - Bits);
+}
+
+void FFT_Proc(uint2 Pos, uint Bit, uint Bits)
+{
+	//Bit = 0..Bits-1
+	const uint Size = (1 << Bits);
+
+	float2 ang = FFT_Tangling((Pos << (1 + Bit)) & (Size - 1), Bits) * 2 * PI / (Size >> Bit);
+	float3 expX, expY;
+	sincos(ang.x, expX.x, expX.y); expX.z = -expX.x;
+	sincos(ang.y, expY.x, expY.y); expY.z = -expY.x;
+
+	const uint2 Select = Pos & (Size >> 1);
+	const uint2 Pos2 = (Pos << 1) & (Size - 1);
+
+	//for (int i = 0; i < FFT_COUNT; ++i)
+	{
+		float4 c00 = InTexture[Pos2 + uint2(0, 0)];
+		float4 c01 = InTexture[Pos2 + uint2(1, 0)];
+		float4 c10 = InTexture[Pos2 + uint2(0, 1)];
+		float4 c11 = InTexture[Pos2 + uint2(1, 1)];
+
+#if FFT_USE_LERP
+		float2 c0p = c00 + c01;
+		float2 c1p = c10 + c11;
+
+		float2 c0m = c00 - c01;
+		float2 c1m = c10 - c11;
+		float2 c0me = float2(dot(c0m, expX.yz), dot(c0m, expX.xy));
+		float2 c1me = float2(dot(c1m, expX.yz), dot(c1m, expX.xy));
+
+		float2 c0 = lerp(c0p, c0me, Select.x);
+		float2 c1 = lerp(c1p, c1me, Select.x);
+
+		float2 cp = c0 + c1;
+		float2 cm = c0 - c1;
+		float2 cme = float2(dot(cm, expY.yz), dot(cm, expY.xy));
+
+		float2 c = lerp(cp, cme, Select.y);
+#else
+		float4 c0, c1;
+		if (Select.x == 0)
+		{
+			c0 = c00 + c01;
+			c1 = c10 + c11;
+		}
+		else
+		{
+			c0 = c00 - c01;
+			c1 = c10 - c11;
+
+			c0.xy = float2(dot(c0.xy, expX.yz), dot(c0.xy, expX.xy));
+			c0.zw = float2(dot(c0.zw, expX.yz), dot(c0.zw, expX.xy));
+
+			c1.xy = float2(dot(c1.xy, expX.yz), dot(c1.xy, expX.xy));
+			c1.zw = float2(dot(c1.zw, expX.yz), dot(c1.zw, expX.xy));
+		}
+
+		float4 c;
+		if (Select.y == 0)
+		{
+			c = c0 + c1;
+		}
+		else
+		{
+			c = c0 - c1;
+
+			c.xy = float2(dot(c.xy, expY.yz), dot(c.xy, expY.xy));
+			c.zw = float2(dot(c.zw, expY.yz), dot(c.zw, expY.xy));
+		}
+#endif
+		OutTexture[Pos] = c;
+	}
+}
+
+
+[numthreads(32, 32, 1)]
+void ExecuteFFT(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	FFT_Proc(DispatchThreadId.xy, ExecuteFFTParams.Bit, ExecuteFFTParams.Bits);
+}
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+
+float2 ComplexMul(float2 a, float2 b)
+{
+	return float2(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
+}
+float2 ComlexConj(float2 c)
+{
+	return float2(c.x, -c.y);
+}
+
+[numthreads(32, 32, 1)]
+void PrepareFFT(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 Pos = DispatchThreadId.xy;
+	const float Ws_Amplitude = 1.0f;
+	const float Ws_Gravity = 9.8f;
+
+	const uint2 PosT = FFT_Tangling(Pos, PrepareFFTParams.Bits);
+	const uint Size = (1 << PrepareFFTParams.Bits);
+
+	float2 k = float2(PosT) / Size;
+	k = k - step(0.5f, k);
+	//float2 f = k * (2 * M_PI); //f = -PI..+PI
+	k *= 2 * PI / PrepareFFTParams.Step;
+
+	float4 h0 = Ws_Amplitude * InSpectrum[Pos];
+
+	float klen = length(k);
+	float klenI = (klen > 0.0f) ? (1.0f / klen) : 0.0f;
+	float2 kn = k * klenI;
+
+	float w = sqrt(klen * Ws_Gravity);
+
+	float2 ce;
+	sincos(-w * PrepareFFTParams.Time, ce.y, ce.x);
+
+#if WAVE_BSPLINE_PREFILTER
+	//this is the spectrum of the BSpline direct transform (transfrom to get coefficients!)
+	//S(z) = 6 / (z + 4 + 1/z), z = exp(i*f) => S(f) = 3 / (cos(f) + 2) 
+	float bsplineSpectrum = 3 * 3 / ((cos(f.x) + 2.0f) * (cos(f.y) + 2.0f));
+	h0 *= bsplineSpectrum;
+#endif
+	//float2 h = cmul(h0, ce);
+	float4 h;
+	h.xy = ComplexMul(h0.xy, ComlexConj(ce)) + ComplexMul(ComlexConj(h0.xy), ce);
+	h.zw = ComplexMul(h0.zw, ComlexConj(ce)) + ComplexMul(ComlexConj(h0.zw), ce);
+
+	float2 ik = float2(-k.y, k.x);
+	OutTexture[Pos] = float4(ComplexMul(h.xy, ik), ComplexMul(h.zw, ik));
+}

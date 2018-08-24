@@ -1,0 +1,876 @@
+#define USE_CONSERVATIVE_DEPTH 1
+#define SKIP_EMPTY_BRICKS 1
+#define INTERSECT_ITERATIONS 5
+#define USE_CUBIC_NORMAL 1
+#define RENDER_WITH_SSR 1
+#define USE_DISTANCE_VS_DENSITY_FALLOFF 0
+
+#include "FluidCommonDefines.usf"
+
+#if DEBUG_MODE
+#define R_DOMAIN_SIZE_X DOMAIN_SIZE_X
+#define R_DOMAIN_SIZE_Y DOMAIN_SIZE_Y
+#define R_DOMAIN_SIZE_Z DOMAIN_SIZE_Z
+
+#define R_BRICK_SIZE_X BRICK_SIZE_X
+#define R_BRICK_SIZE_Y BRICK_SIZE_Y
+#define R_BRICK_SIZE_Z BRICK_SIZE_Z
+
+#define R_LEVEL_VALUE LevelValue
+#else
+#define R_DOMAIN_SIZE_X LS_DOMAIN_SIZE_X
+#define R_DOMAIN_SIZE_Y LS_DOMAIN_SIZE_Y
+#define R_DOMAIN_SIZE_Z LS_DOMAIN_SIZE_Z
+
+#define R_BRICK_SIZE_X LS_BRICK_SIZE_X
+#define R_BRICK_SIZE_Y LS_BRICK_SIZE_Y
+#define R_BRICK_SIZE_Z LS_BRICK_SIZE_Z
+
+#define R_LEVEL_VALUE SURFACE_LEVELSET_AT
+#endif
+
+float LevelValue;
+
+int WavesEnabled;
+int DiffuseParticlesEnabled;
+int ShowTexCoords;
+
+Texture2D		FluidDepthTexture;
+SamplerState	FluidDepthTextureSampler;
+
+Texture2D		FluidTexCoordTexture;
+SamplerState	FluidTexCoordTextureSampler;
+
+Texture2D		FluidTexCoordWTexture;
+SamplerState	FluidTexCoordWTextureSampler;
+
+float4			FluidTexCoordsWeights;
+
+
+float DistanceExpCoeff;
+float DistanceOffset;
+Texture2D AttenuationTexture;
+SamplerState AttenuationTextureSampler;
+Texture2D DiffuseTexture;
+SamplerState DiffuseTextureSampler;
+
+float4 DiffuseColorMod;
+float4 AttenuationColorMod;
+
+Texture2D<float4> WavesTexture;
+SamplerState WavesTextureSampler;
+float WavesAmplitude;
+float WavesLengthPeriod;
+
+float4x4 WorldToVolume;
+float4x4 VolumeToWorld;
+float3   ViewOriginInVolumeCS;
+
+/** Textures. */
+Texture3D<uint> BrickMapTexture;
+Texture3D<float> LiquidSurfaceTexture;
+SamplerState LiquidSurfaceTextureSampler;
+
+
+float4 SkyInscatteredColor;
+
+float4 SkyDiffuseColor;
+float3 DirectionalLightDirection;
+float4 DirectionalLightColor;
+
+float Reflectivity;
+
+float ScreenDepthOffset;
+
+//DiffuseParticlesRenering
+Texture2D		FluidFoamTexture;
+SamplerState	FluidFoamTextureSampler;
+
+float3 BubbleDiffuseColor;
+float3 BubbleAttenuationColor;
+
+float3 DParticleIntensityMod;
+float3 DParticleIntensityExp;
+
+float3 FoamColor;
+float3 SprayColor;
+
+#if 0
+Texture3D<float> ParticlesDensityTexture;
+SamplerState ParticlesDensityTextureSampler;
+
+float GetDensityValue(float3 surfPos)
+{
+	const float3 TexelSize = float3(1.0f / R_DOMAIN_SIZE_X, 1.0f / R_DOMAIN_SIZE_Y, 1.0f / R_DOMAIN_SIZE_Z);
+	float3 tpos = (surfPos + 0.5f) * TexelSize;
+
+	return ParticlesDensityTexture.SampleLevel(ParticlesDensityTextureSampler, tpos, 0).x;
+}
+#endif
+
+float4 FalloffInfo; //xy = Distance Range, zw = Density Range
+
+float2 BlobCullInfo; //x = Distance, y = Density
+
+//------------------------------------------------------------------------------
+
+#if 1
+Texture3D TranslucencyLightingVolumeAmbientInner;
+SamplerState TranslucencyLightingVolumeAmbientInnerSampler;
+Texture3D TranslucencyLightingVolumeAmbientOuter;
+SamplerState TranslucencyLightingVolumeAmbientOuterSampler;
+Texture3D TranslucencyLightingVolumeDirectionalInner;
+SamplerState TranslucencyLightingVolumeDirectionalInnerSampler;
+Texture3D TranslucencyLightingVolumeDirectionalOuter;
+SamplerState TranslucencyLightingVolumeDirectionalOuterSampler;
+
+float3 GetDirectLighting(float3 WorldPosition, float3 WorldNormal)
+{
+	const float3 LightingPositionOffset = float3(0, 0, 0);
+
+	// Apply a stable offset to the world position used for lighting, which breaks up artifacts from using a low res volume texture
+	float3 InnerVolumeUVs = (WorldPosition + LightingPositionOffset - View.TranslucencyLightingVolumeMin[0].xyz) * View.TranslucencyLightingVolumeInvSize[0].xyz;
+	float3 OuterVolumeUVs = (WorldPosition + LightingPositionOffset - View.TranslucencyLightingVolumeMin[1].xyz) * View.TranslucencyLightingVolumeInvSize[1].xyz;
+
+	// Controls how fast the lerp between the inner and outer cascades happens
+	// Larger values result in a shorter transition distance
+	float TransitionScale = 6;
+	// Setup a 3d lerp factor going to 0 at the edge of the inner volume
+	float3 LerpFactors = saturate((.5f - abs(InnerVolumeUVs - .5f)) * TransitionScale);
+	float FinalLerpFactor = LerpFactors.x * LerpFactors.y * LerpFactors.z;
+
+	// Fetch both the ambient and directional values for both cascades
+	float4 InnerVector0 = Texture3DSampleLevel(TranslucencyLightingVolumeAmbientInner, TranslucencyLightingVolumeAmbientInnerSampler, InnerVolumeUVs, 0);
+	float3 InnerVector1 = Texture3DSampleLevel(TranslucencyLightingVolumeDirectionalInner, TranslucencyLightingVolumeAmbientInnerSampler, InnerVolumeUVs, 0).rgb;
+	float4 OuterVector0 = Texture3DSampleLevel(TranslucencyLightingVolumeAmbientOuter, TranslucencyLightingVolumeAmbientInnerSampler, OuterVolumeUVs, 0);
+	float3 OuterVector1 = Texture3DSampleLevel(TranslucencyLightingVolumeDirectionalOuter, TranslucencyLightingVolumeAmbientInnerSampler, OuterVolumeUVs, 0).rgb;
+
+	float DirectionalLightingIntensity = 1;//GetMaterialTranslucencyDirectionalLightingIntensity();
+
+										   // Lerp between cascades
+										   // Increase the directional coefficients and attenuate the ambient coefficient based on a tweaked value
+	float4 Vector0 = lerp(OuterVector0, InnerVector0, FinalLerpFactor) / DirectionalLightingIntensity;
+	float3 Vector1 = lerp(OuterVector1, InnerVector1, FinalLerpFactor) * DirectionalLightingIntensity;
+
+	// Reconstruct the SH coefficients based on what was encoded
+	FTwoBandSHVectorRGB TranslucentLighting;
+	TranslucentLighting.R.V.x = Vector0.r;
+	TranslucentLighting.G.V.x = Vector0.g;
+	TranslucentLighting.B.V.x = Vector0.b;
+	float3 NormalizedAmbientColor = Vector0.rgb / Luminance(Vector0.rgb);
+
+	// Scale the monocrome directional coefficients with the normalzed ambient color as an approximation to the uncompressed values
+	TranslucentLighting.R.V.yzw = Vector1.rgb * NormalizedAmbientColor.r;
+	TranslucentLighting.G.V.yzw = Vector1.rgb * NormalizedAmbientColor.g;
+	TranslucentLighting.B.V.yzw = Vector1.rgb * NormalizedAmbientColor.b;
+
+	// Compute diffuse lighting which takes the normal into account
+	FTwoBandSHVector DiffuseTransferSH = CalcDiffuseTransferSH(WorldNormal, 1);
+	float4 VolumeLighting = float4(max(half3(0, 0, 0), DotSH(TranslucentLighting, DiffuseTransferSH)), Vector0.a);
+	return VolumeLighting.rgb;
+}
+#else
+float3 GetDirectLighting(float3 WorldPosition, float3 WorldNormal)
+{
+	return max(-dot(DirectionalLightDirection, WorldNormal), 0)*DirectionalLightColor.rgb;
+}
+#endif
+
+float3 GetDirectInscatteredLighting(float3 WorldPosition, float3 ViewDir)
+{
+	float cosLV = -dot(DirectionalLightDirection, ViewDir);
+	//Mie scattering approximation (Nishita et al. [1987])
+	float phase = (0.5f + 4.5 * pow((1.0f + cosLV)*0.5f, 8.0f)) / 4;
+	// 1/PI premultiplied in DirectionalLightColor
+	return DirectionalLightColor.rgb * phase;
+}
+
+#if RENDER_WITH_SSR
+#include "ScreenSpaceRayCast.usf"
+
+Texture2D		HZBTexture;
+SamplerState	HZBSampler;
+Texture2D		PrevSceneColor;
+SamplerState	PrevSceneColorSampler;
+#endif
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM5
+/** Prenormalized capture of the scene that's closest to the object being rendered, used for reflection environment on translucency. */
+TextureCubeArray ReflectionCubemap;
+SamplerState ReflectionCubemapSampler;
+int CubemapArrayIndex;
+#else
+TextureCube ReflectionCubemap;
+SamplerState ReflectionCubemapSampler;
+#endif
+
+uint MortonCode(uint x)
+{
+	//x = (x ^ (x <<  8)) & 0x00ff00ff;
+	//x = (x ^ (x <<  4)) & 0x0f0f0f0f;
+	x = (x ^ (x << 2)) & 0x33333333;
+	x = (x ^ (x << 1)) & 0x55555555;
+	return x;
+}
+
+float3 GetImageBasedReflection(float3 ReflectionVector, half Roughness, float3 WorldPosition, float2 ScreenPos, float Depth)
+{
+	float4 SpecularIBL;
+#if 0
+	half AbsoluteSpecularMip = ComputeReflectionCaptureMipFromRoughness(Roughness);
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM5
+	float4 SpecularIBL = TextureCubeArraySampleLevel(ReflectionCubemap, ReflectionCubemapSampler, ReflectionVector, CubemapArrayIndex, AbsoluteSpecularMip);
+#else
+	float4 SpecularIBL = TextureCubeSampleLevel(ReflectionCubemap, ReflectionCubemapSampler, ReflectionVector, AbsoluteSpecularMip);
+#endif
+#endif
+
+#if 1 //ENABLE_SKY_LIGHT
+	//if (SkyLightParameters.y > 0 && SpecularIBL.a < .999f)
+	{
+		float SkyAverageBrightness = 1.0f;
+		float3 SkyLighting = GetSkyLightReflection(ReflectionVector, Roughness, SkyAverageBrightness);
+
+		// Add in sky wherever reflection captures don't have coverage
+		//SpecularIBL.rgb += (1 - SpecularIBL.a) * SkyLighting;
+		SpecularIBL.rgb = SkyLighting;
+	}
+#endif
+
+#if RENDER_WITH_SSR
+	float3 WorldPosition_CamRelative = WorldPosition + View.PreViewTranslation.xyz;
+	if (View.CameraCut == 0)
+	{
+		//uint FrameRandom = (uint)(View.TemporalAAParams.r * 1551);
+		uint FrameRandom = (View.FrameNumber & 15) * 1551;
+
+		uint Morton = MortonCode((uint)ScreenPos.x & 3) | (MortonCode((uint)ScreenPos.y & 3) * 2);
+		uint PixelIndex = ReverseBits32(Morton) >> 28;
+		//uint PixelIndex = ( (uint)MaterialParameters.SVPosition.x & 3 ) | ( ( (uint)MaterialParameters.SVPosition.y & 3 ) * 2 );
+		//PixelIndex = ( PixelIndex * 1551 ) & 15;
+
+		uint Offset = (PixelIndex + FrameRandom) & 15;
+		float StepOffset = Offset / 15.0;
+		StepOffset -= 0.5;
+
+		float4 HitUVzTime;
+		float HCBLevel;
+
+		RayCast(
+			HZBTexture, HZBSampler, float2(1, 1),
+			WorldPosition_CamRelative, ReflectionVector, 0, 0, Depth,
+			12, StepOffset,
+			HitUVzTime, HCBLevel
+			);
+
+		// if there was a hit
+		BRANCH if (HitUVzTime.w < 1)
+		{
+			float4 SSR = SampleScreenColor(PrevSceneColor, PrevSceneColorSampler, HitUVzTime.xyz);
+			//SSR *= saturate(2 - 6.6 * Roughness);
+			SpecularIBL.rgb = SpecularIBL.rgb * (1 - SSR.a) + SSR.rgb;
+		}
+	}
+#endif
+
+	//half NoV = saturate(dot(MaterialParameters.WorldNormal, MaterialParameters.CameraVector));
+	//SpecularColor = EnvBRDFApprox(SpecularColor, Roughness, NoV);
+
+	return SpecularIBL.rgb;// *SpecularColor;
+}
+
+void GetWaterColors(float3 VoxelPos, float Dist, float3 ViewDir, out float3 DiffuseColor, out float3 AttenuationColor, float BubbleIntensity)
+{
+	float U = 1 - exp(-(Dist + DistanceOffset)*DistanceExpCoeff);
+#if 0
+	float V = (-ViewDir.z + 1) * 0.5f;
+	DiffuseColor = DiffuseColorMod.rgb * Texture2DSampleLevel(DiffuseTexture, DiffuseTextureSampler, fl, float2(U, V), 0).rgb;
+#else
+	float UCos = 1 - exp(-(Dist + DistanceOffset)*DistanceExpCoeff*(1 - ViewDir.z));
+	DiffuseColor = DiffuseColorMod.rgb * Texture2DSampleLevel(DiffuseTexture, DiffuseTextureSampler, float2(UCos, 0), 0).rgb;
+#endif
+	AttenuationColor = AttenuationColorMod.rgb * Texture2DSampleLevel(AttenuationTexture, AttenuationTextureSampler, float2(U, 0), 0).rgb;
+
+	DiffuseColor = lerp(DiffuseColor, BubbleDiffuseColor, BubbleIntensity);
+	AttenuationColor = lerp(AttenuationColor, BubbleAttenuationColor, BubbleIntensity);
+
+	float DistanceFalloff = smoothstep(FalloffInfo.x, FalloffInfo.y, Dist);
+	//float DensityFalloff = smoothstep(FalloffInfo.z, FalloffInfo.w, GetDensityValue(VoxelPos));
+	float TotalFalloff = DistanceFalloff;// *DensityFalloff;
+
+	DiffuseColor = lerp(float3(0, 0, 0), DiffuseColor, TotalFalloff);
+	AttenuationColor = lerp(float3(1, 1, 1), AttenuationColor, TotalFalloff);
+}
+
+//------------------------------------------------------------------------------
+// Water Shading
+//------------------------------------------------------------------------------
+
+interface IWaterShader
+{
+	void OnEnterSurface(float3 WorldNormal, float3 WorldPosition, float Depth);
+	void OnExitSurface(float3 VoxelPos, float Dist);
+
+	float3 GetFinalColor();
+};
+
+class WaterShaderImpl : IWaterShader
+{
+	float3 BlendColor;
+	float3 AddColor;
+
+	float4 TexCoord;
+	float  TexCoordW;
+
+	float3 EnvDiffuseLighting;
+	float3 WorldViewDir;
+	float2 ScreenUV;
+	float2 PixelPos;
+
+	float3 SurfNormal;
+	float BubbleIntensity;
+
+	void Init(float3 InWorldViewDir, float2 InScreenUV, float2 InPixelPos)
+	{
+		AddColor = float3(0, 0, 0);
+		BlendColor = float3(1, 1, 1);
+
+		EnvDiffuseLighting = SkyDiffuseColor.rgb + max(-DirectionalLightDirection.z, 0) * DirectionalLightColor.rgb;
+		WorldViewDir = InWorldViewDir;
+		ScreenUV = InScreenUV;
+		PixelPos = InPixelPos;
+
+		TexCoord = FluidTexCoordTexture.SampleLevel(FluidTexCoordTextureSampler, ScreenUV, 0);
+		TexCoordW = FluidTexCoordWTexture.SampleLevel(FluidTexCoordWTextureSampler, ScreenUV, 0).x;
+		TexCoord /= TexCoordW;
+
+		SurfNormal = float3(0, 0, 1);
+		BubbleIntensity = 0;
+	}
+
+	void OnEnterSurface(float3 WorldNormal, float3 WorldPosition, float Depth)
+	{
+		float3 V = WorldViewDir; //WorldViewDir should be normalized!
+		float3 N = WorldNormal; //WorldNormal should be normalized!
+
+		if (ShowTexCoords)
+		{
+			int2 uv1 = int2(floor(TexCoord.xy / 100.0f));
+			int2 uv2 = int2(floor(TexCoord.zw / 100.0f));
+
+			float t1 = 0, t2 = 0;
+			if (TexCoordW > 0.0f)
+			{
+				t1 = (((uv1.x + uv1.y) & 1)*0.7f + 0.3f) * FluidTexCoordsWeights.x;
+				t2 = (((uv2.x + uv2.y) & 1)*0.7f + 0.3f) * FluidTexCoordsWeights.y;
+			}
+
+			BlendColor = float3(0, 0, 0);
+			AddColor = float3(t1, t2, 0) * DirectionalLightColor.rgb * abs(dot(N, V));
+			return;
+		}
+
+		if (WavesEnabled && TexCoordW > 0.0f)
+		{
+		    float4 tc = TexCoord.xyzw*0.5 + WorldPosition.xyxy*0.5;
+			float2 WGrad0 = WavesTexture.SampleLevel(WavesTextureSampler, tc.xy / WavesLengthPeriod, 0).xy;
+			float2 WGrad1 = WavesTexture.SampleLevel(WavesTextureSampler, tc.zw / WavesLengthPeriod, 0).zw;
+
+			float2 WGrad = (WGrad0 * FluidTexCoordsWeights.x + WGrad1 * FluidTexCoordsWeights.y) / dot(FluidTexCoordsWeights.xy, FluidTexCoordsWeights.xy);
+
+			N.xy -= WGrad * (WavesAmplitude * saturate(N.z));
+			N = normalize(N);
+		}
+		SurfNormal = N;
+
+		float3 R = V - (2 * dot(V, N)) * N;
+
+		float WaterRefractionIndex = 1.33;
+		float AirRefractionIndex = 1.0;
+		float FresnelBounds = (AirRefractionIndex - WaterRefractionIndex)*(AirRefractionIndex - WaterRefractionIndex) / ((AirRefractionIndex + WaterRefractionIndex)*(AirRefractionIndex + WaterRefractionIndex));
+		float Fresnel = FresnelBounds + (1.0 - FresnelBounds)*pow(saturate(1.0 - dot(N, -V)), 5.0);
+		Fresnel *= 1.0 - pow(saturate(dot(V, R)), 3.0); // Damping down Fresnel for extremely small angles to cope with (possibley incorrect UE4 implementation?) SSR darkening
+
+		float3 ReflectionColor = GetImageBasedReflection(R, 0.0f, WorldPosition, PixelPos, Depth);
+
+		AddColor += (BlendColor * Fresnel) * ReflectionColor;
+		BlendColor *= (1 - Fresnel);
+
+		//diffuse particles
+		if (DiffuseParticlesEnabled)
+		{
+			float3 DParticlesThickness = FluidFoamTexture.SampleLevel(FluidFoamTextureSampler, ScreenUV, 0).rgb;
+			float3 DParticlesThicknessExp = pow(abs(DParticlesThickness), DParticleIntensityExp);
+			float3 DParticlesIntensity = DParticlesThicknessExp / (DParticleIntensityMod + DParticlesThicknessExp);
+
+			float3 FoamLighting = SkyDiffuseColor.rgb + GetDirectLighting(WorldPosition.xyz, N);
+			float FoamIntensity = DParticlesIntensity.g;
+			BlendColor *= (1 - FoamIntensity);
+			AddColor *= (1 - FoamIntensity);
+			AddColor += FoamLighting * FoamColor * FoamIntensity;
+
+			float3 SprayLighting = SkyInscatteredColor.rgb * 2 + GetDirectInscatteredLighting(WorldPosition.xyz, V);
+			float SprayIntensity = DParticlesIntensity.b;
+			BlendColor *= (1 - SprayIntensity);
+			AddColor *= (1 - SprayIntensity);
+			AddColor += SprayLighting * SprayColor * SprayIntensity;
+
+			BubbleIntensity = DParticlesIntensity.r;
+		}
+	}
+
+	void OnExitSurface(float3 VoxelPos, float Dist)
+	{
+		float3 DiffuseColor, AttenuationColor;
+		GetWaterColors(VoxelPos, Dist, WorldViewDir, DiffuseColor, AttenuationColor, BubbleIntensity);
+
+		DiffuseColor *= EnvDiffuseLighting;
+
+		AddColor += BlendColor * DiffuseColor;
+		BlendColor *= AttenuationColor;
+	}
+
+	float3 GetFinalColor()
+	{
+		float3 RefractionDisturbance = mul(float4(SurfNormal.x, SurfNormal.y, 0, 0), View.TranslatedWorldToView).xyz;
+
+		float2 ScreenPos = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+		ScreenPos += float2(-RefractionDisturbance.x, -RefractionDisturbance.z) * 2 * 0.04; // maximum distortion is 4% of the view extent
+		ScreenPos = max(float2(-0.999, -0.999), ScreenPos);
+		ScreenPos = min(float2(0.999, 0.999), ScreenPos);
+		float2 RefractedScreenUV = (ScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz);
+
+		float3 RefractionColor = DecodeSceneColorForMaterialNode(RefractedScreenUV);
+		float3 FinalColor = AddColor + BlendColor * RefractionColor;
+
+		return FinalColor;
+	}
+};
+
+//------------------------------------------------------------------------------
+
+// intersect ray with axis-aligned bounding box
+float intersectUnitBoxNear(float3 rayOrigin, float3 rayDir)
+{
+	//using this formula dist is always >= 0 or equals to +INF, or NAN, which produces correct result in min(x, y, z)
+	float3 dist = (rayOrigin + (step(0, rayDir) - 1)) / rayDir;
+	return min(min(dist.x, dist.y), dist.z);
+}
+
+bool getCameraRay(float4 SvPosition, float4 VolumePos, float SceneDepth, out float3 rayDir, out float4 rayBeg, out float4 rayEnd)
+{
+	// calculate ray in volume texture space
+	rayDir = (VolumePos.xyz - ViewOriginInVolumeCS.xyz);
+
+	// find box intersection
+	float t0 = SvPosition.w * (1 - intersectUnitBoxNear(VolumePos.xyz, rayDir));
+	float t1 = SvPosition.w;
+	rayDir /= SvPosition.w;
+
+	t0 = max(View.NearPlane, t0); // handle camera inside box
+
+	float tScene = SceneDepth;
+	if (tScene < t0) {
+		// scene is closer than nearest surface of box
+		return false;
+	}
+	t1 = min(t1, tScene);
+
+	rayBeg = float4(ViewOriginInVolumeCS.xyz + t0 * rayDir, t0);
+	rayEnd = float4(ViewOriginInVolumeCS.xyz + t1 * rayDir, t1);
+	return true;
+}
+
+interface ITraceCallback
+{
+	bool LastInside();
+	bool HasWaterShader();
+	bool HasResult();
+	void SetHasResult(bool hr);
+	void SetLastInside(bool hr);
+	void SetLastPos(float4 lp);
+	float4 GetLastPos();
+	float GetWorldRayDirLen();
+	void AddFluidDist(float Distance);
+	void SetDepth(float Dep);
+	void SetWaterShaderDebug(float3 N);
+	void WaterShaderOnExitSurface(float4 surfPos);
+	void WaterShaderOnEnterSurface(float4 surfPos);
+	bool onIntersect(float4 surfPos, float f0, float f1);
+};
+
+int sampleBrickMap(int3 ijk)
+{
+	return BrickMapTexture[ijk] == 2 ? 1 : 0;
+}
+
+bool checkVoxel(int3 ijk, out float s[8])
+{
+	s[0] = LiquidSurfaceTexture[ijk + int3(0, 0, 0)];
+	s[1] = LiquidSurfaceTexture[ijk + int3(1, 0, 0)];
+	s[2] = LiquidSurfaceTexture[ijk + int3(0, 1, 0)];
+	s[3] = LiquidSurfaceTexture[ijk + int3(1, 1, 0)];
+	s[4] = LiquidSurfaceTexture[ijk + int3(0, 0, 1)];
+	s[5] = LiquidSurfaceTexture[ijk + int3(1, 0, 1)];
+	s[6] = LiquidSurfaceTexture[ijk + int3(0, 1, 1)];
+	s[7] = LiquidSurfaceTexture[ijk + int3(1, 1, 1)];
+
+	//TODO: use min/max texture filtering mode!
+	float smin = min(min(min(s[0], s[1]), min(s[2], s[3])), min(min(s[4], s[5]), min(s[6], s[7])));
+	float smax = max(max(max(s[0], s[1]), max(s[2], s[3])), max(max(s[4], s[5]), max(s[6], s[7])));
+
+	return smin <= R_LEVEL_VALUE && R_LEVEL_VALUE <= smax;
+}
+
+float evalSurfGradComp(float3 i, float3 w1, float3 w01, float3 w3, float3 w23, uniform int comp)
+{
+	const float3 TexelSize = float3(1.0f / R_DOMAIN_SIZE_X, 1.0f / R_DOMAIN_SIZE_Y, 1.0f / R_DOMAIN_SIZE_Z);
+
+	float3 t0 = (i - 1 + w1 / w01) * TexelSize;
+	float3 t1 = (i + 1 + w3 / w23) * TexelSize;
+
+	float s[8];
+	s[0] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t0.y, t0.z), 0);
+	s[1] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t0.y, t0.z), 0);
+	s[2] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t1.y, t0.z), 0);
+	s[3] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t1.y, t0.z), 0);
+	s[4] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t0.y, t1.z), 0);
+	s[5] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t0.y, t1.z), 0);
+	s[6] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t0.x, t1.y, t1.z), 0);
+	s[7] = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, float3(t1.x, t1.y, t1.z), 0);
+
+	const int comp1 = (comp + 1) % 3;
+	const int comp2 = (comp + 2) % 3;
+
+	const int s0 = (1 << comp);
+	const int s1 = (1 << comp1);
+	const int s2 = (1 << comp2);
+
+	float a = lerp(s[0], s[0 + s2], w23[comp2]);
+	float b = lerp(s[0 + s1], s[0 + s1 + s2], w23[comp2]);
+	float ab = lerp(a, b, w23[comp1]);
+
+	float c = lerp(s[s0], s[s0 + s2], w23[comp2]);
+	float d = lerp(s[s0 + s1], s[s0 + s1 + s2], w23[comp2]);
+	float cd = lerp(c, d, w23[comp1]);
+
+	return (cd - ab) * w23[comp];
+}
+
+float3 CalcSurfaceGrad(float3 pos)
+{
+#if USE_CUBIC_NORMAL
+	float3 i = floor(pos) + 0.5f;
+	float3 t = frac(pos);
+	float3 t2 = t*t;
+	float3 t3 = t2*t;
+
+	static const float m = 1 / 6.0;
+	float3 w0 = m * (-t3 + 3 * t2 - 3 * t + 1);
+	float3 w1 = m * (3 * t3 - 6 * t2 + 4);
+	float3 w2 = m * (-3 * t3 + 3 * t2 + 3 * t + 1);
+	float3 w3 = m * t3;
+
+	float3 dw0 = 0.5f * (-t2 + 2 * t - 1);
+	float3 dw1 = 0.5f * (3 * t2 - 4 * t);
+	float3 dw2 = 0.5f * (-3 * t2 + 2 * t + 1);
+	float3 dw3 = 0.5f * t2;
+
+	float3 w01 = w0 + w1;
+	float3 w23 = w2 + w3;
+
+	float3 dw01 = dw0 + dw1;
+	float3 dw23 = dw2 + dw3;
+
+	float3 n;
+	n.x = evalSurfGradComp(i, float3(dw1.x, w1.yz), float3(dw01.x, w01.yz), float3(dw3.x, w3.yz), float3(dw23.x, w23.yz), 0);
+	n.y = evalSurfGradComp(i, float3(w1.x, dw1.y, w1.z), float3(w01.x, dw01.y, w01.z), float3(w3.x, dw3.y, w3.z), float3(w23.x, dw23.y, w23.z), 1);
+	n.z = evalSurfGradComp(i, float3(w1.xy, dw1.z), float3(w01.xy, dw01.z), float3(w3.xy, dw3.z), float3(w23.xy, dw23.z), 2);
+	return n;
+#else
+	const float3 TexelSize = float3(1.0f / R_DOMAIN_SIZE_X, 1.0f / R_DOMAIN_SIZE_Y, 1.0f / R_DOMAIN_SIZE_Z);
+	float3 texPos = (pos + 0.5f) * TexelSize;
+
+	float3 n;
+	n.x = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, texPos + float3(+ScaleUVW.x, 0, 0), 0) -
+		LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, texPos + float3(-ScaleUVW.x, 0, 0), 0);
+	n.y = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, texPos + float3(0, +ScaleUVW.y, 0), 0) -
+		LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, texPos + float3(0, -ScaleUVW.y, 0), 0);
+	n.z = LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, texPos + float3(0, 0, +ScaleUVW.z), 0) -
+		LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, texPos + float3(0, 0, -ScaleUVW.z), 0);
+
+	return n;
+#endif
+}
+
+bool intersectInterval(ITraceCallback callback, float4 beg, float4 end, float A, float B, float C, float D, float t0, float t1, float f0, float f1)
+{
+	[unroll]
+	for (int i = 0; i < INTERSECT_ITERATIONS; ++i)
+	{
+		float t = t0 + (t1 - t0) * (0 - f0) / (f1 - f0);
+		float f = D + C*t + B*t*t + A*t*t*t;
+		if (sign(f0) == sign(f))
+		{
+			t0 = t; f0 = f;
+		}
+		else
+		{
+			t1 = t; f1 = f;
+		}
+	}
+	float t = t0 + (t1 - t0) * (0 - f0) / (f1 - f0);
+	float4 surfPos = lerp(beg, end, t);
+	// copy both the onIntersect because when we try to do callback.onintersect we get an compilation error for unknown reason.
+#if DEBUG_MODE
+	float3 surfNorm = CalcSurfaceGrad(surfPos.xyz);
+	//note: since VoxelSize is uniform in world space normal is correct!
+	float3 N = normalize(surfNorm);
+
+	callback.SetWaterShaderDebug(N);
+
+	callback.SetHasResult(true);
+	return true; /* true = stop tracing! */
+#else
+	if (callback.HasWaterShader())
+	{
+		if (callback.LastInside())
+		{//trace out of water volume
+			callback.WaterShaderOnExitSurface(surfPos);
+
+			callback.SetLastInside(false);
+		}
+		else
+		{//trace into water volume
+
+			callback.WaterShaderOnEnterSurface(surfPos);
+
+			callback.SetLastInside(true);
+			if (!callback.HasResult())
+			{
+				callback.SetDepth(surfPos.w);
+			}
+		}
+		callback.SetHasResult(true);
+	}
+	else
+	{
+		if (callback.LastInside())
+		{//trace out of water volume
+			float Distance = (surfPos.w - callback.GetLastPos().w) * callback.GetWorldRayDirLen();
+			if (Distance >= BlobCullInfo.x)
+			{
+				callback.AddFluidDist(Distance);
+				if (!callback.HasResult())
+				{
+					callback.SetDepth(callback.GetLastPos().w);
+					callback.SetHasResult(true);
+				}
+			}
+			callback.SetLastInside(false);
+		}
+		else
+		{//trace into water volume
+			callback.SetLastInside(true);
+		}
+	}
+	callback.SetLastPos(surfPos);
+	return false;
+#endif
+}
+
+bool intersectVoxel(ITraceCallback callback, float4 beg, float4 end, int3 ijk, float s[8])
+{
+	float3 ua[2], ub[2];
+	ua[1] = beg.xyz - ijk; ua[0] = 1 - ua[1];
+	ub[1] = end.xyz - beg.xyz; ub[0] = -ub[1];
+
+	float A, B, C, D;
+	A = B = C = D = 0;
+	[unroll]
+	for (int n = 0; n < 8; ++n)
+	{
+		int nx = n & 1, ny = (n >> 1) & 1, nz = (n >> 2) & 1;
+
+		A += s[n] * (ub[nx].x * ub[ny].y * ub[nz].z);
+		B += s[n] * (ua[nx].x * ub[ny].y * ub[nz].z + ub[nx].x * ua[ny].y * ub[nz].z + ub[nx].x * ub[ny].y * ua[nz].z);
+		C += s[n] * (ub[nx].x * ua[ny].y * ua[nz].z + ua[nx].x * ub[ny].y * ua[nz].z + ua[nx].x * ua[ny].y * ub[nz].z);
+		D += s[n] * (ua[nx].x * ua[ny].y * ua[nz].z);
+	}
+	D -= R_LEVEL_VALUE;
+
+
+	float t0 = 0, t1 = 1;
+	float f0 = D, f1 = D + C + B + A;
+
+	//find roots of df/dt = 3*A*t*t + 2*B*t + C = 0
+	float dSqr = B*B - 3 * A*C;
+	if (dSqr >= 0.0f)
+	{
+		float d = sqrt(dSqr);
+		float tr1 = (-B - d) / (3 * A);
+		float tr2 = (-B + d) / (3 * A);
+		float trMin = min(tr1, tr2);
+		float trMax = max(tr1, tr2);
+		if (trMin > t0 && trMin < t1)
+		{
+			float frMin = D + C*trMin + B*trMin*trMin + A*trMin*trMin*trMin;
+			if (sign(frMin) != sign(f0))
+			{
+				if (intersectInterval(callback, beg, end, A, B, C, D, t0, trMin, f0, frMin))
+				{
+					return true;
+				}
+			}
+			t0 = trMin; f0 = frMin;
+		}
+		if (trMax > t0 && trMax < t1)
+		{
+			float frMax = D + C*trMax + B*trMax*trMax + A*trMax*trMax*trMax;
+			if (sign(frMax) != sign(f0))
+			{
+				if (intersectInterval(callback, beg, end, A, B, C, D, t0, trMax, f0, frMax))
+				{
+					return true;
+				}
+			}
+			t0 = trMax; f0 = frMax;
+		}
+	}
+	if (sign(f0) != sign(f1))
+	{
+		if (intersectInterval(callback, beg, end, A, B, C, D, t0, t1, f0, f1))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool traceBrick(ITraceCallback callback, float4 rayBeg, float4 rayEnd, float3 rayDir, int3 ijk0)
+{
+	const int3 brickSize = int3(R_BRICK_SIZE_X, R_BRICK_SIZE_Y, R_BRICK_SIZE_Z);
+
+	ijk0 *= brickSize;
+	rayBeg.xyz *= brickSize; rayEnd.xyz *= brickSize; rayDir.xyz *= brickSize;
+
+	int3 ijk;
+	ijk.x = (rayDir.x >= 0.0f) ? floor(rayBeg.x) : ceil(rayBeg.x) - 1;
+	ijk.y = (rayDir.y >= 0.0f) ? floor(rayBeg.y) : ceil(rayBeg.y) - 1;
+	ijk.z = (rayDir.z >= 0.0f) ? floor(rayBeg.z) : ceil(rayBeg.z) - 1;
+
+	float4 xStep = float4(rayDir, 1) / abs(rayDir.x);
+	float4 yStep = float4(rayDir, 1) / abs(rayDir.y);
+	float4 zStep = float4(rayDir, 1) / abs(rayDir.z);
+
+	float3 rayRound = float3(ijk) + step(0, rayDir);
+	float3 rayDelta = abs(rayRound - rayBeg.xyz);
+
+	float4 xNext, yNext, zNext;
+	xNext.yzw = xStep.yzw * rayDelta.x + rayBeg.yzw; xNext.x = rayRound.x;
+	yNext.xzw = yStep.xzw * rayDelta.y + rayBeg.xzw; yNext.y = rayRound.y;
+	zNext.xyw = zStep.xyw * rayDelta.z + rayBeg.xyw; zNext.z = rayRound.z;
+
+	int3 ijkStep = sign(rayDir);
+
+	float4 rayCurr = rayBeg, rayNext;
+	while (!any((ijk - ijk0) & ~(brickSize - 1)) && rayCurr.w < rayEnd.w)
+	{
+		float w = min(xNext.w, min(yNext.w, zNext.w));
+		if (rayEnd.w <= w)
+		{
+			rayNext = rayEnd;
+		}
+		else
+		{
+			rayNext = (w == xNext.w) ? xNext : (w == yNext.w) ? yNext : zNext;
+		}
+
+		float samples[8];
+		if (checkVoxel(ijk, samples))
+		{
+			if (intersectVoxel(callback, rayCurr, rayNext, ijk, samples))
+			{
+				return true;
+			}
+		}
+
+		int3 comp = int3(w == xNext.w, w == yNext.w, w == zNext.w);
+		ijk += comp * ijkStep;
+		xNext += comp.x * xStep;
+		yNext += comp.y * yStep;
+		zNext += comp.z * zStep;
+
+		rayCurr = rayNext;
+	}
+	return false;
+}
+
+float4 traceGrid(ITraceCallback callback, float4 rayBeg, float4 rayEnd, float3 rayDir)
+{
+	const int3 gridSize = int3(R_DOMAIN_SIZE_X / R_BRICK_SIZE_X, R_DOMAIN_SIZE_Y / R_BRICK_SIZE_Y, R_DOMAIN_SIZE_Z / R_BRICK_SIZE_Z);
+
+	rayBeg.xyz *= gridSize; rayEnd.xyz *= gridSize; rayDir.xyz *= gridSize;
+
+	int3 ijk;
+	ijk.x = (rayDir.x >= 0.0f) ? floor(rayBeg.x) : ceil(rayBeg.x) - 1;
+	ijk.y = (rayDir.y >= 0.0f) ? floor(rayBeg.y) : ceil(rayBeg.y) - 1;
+	ijk.z = (rayDir.z >= 0.0f) ? floor(rayBeg.z) : ceil(rayBeg.z) - 1;
+
+	float4 xStep = float4(rayDir, 1) / abs(rayDir.x);
+	float4 yStep = float4(rayDir, 1) / abs(rayDir.y);
+	float4 zStep = float4(rayDir, 1) / abs(rayDir.z);
+
+	float3 rayRound = float3(ijk) + step(0, rayDir);
+	float3 rayDelta = abs(rayRound - rayBeg.xyz);
+
+	float4 xNext, yNext, zNext;
+	xNext.yzw = xStep.yzw * rayDelta.x + rayBeg.yzw; xNext.x = rayRound.x;
+	yNext.xzw = yStep.xzw * rayDelta.y + rayBeg.xzw; yNext.y = rayRound.y;
+	zNext.xyw = zStep.xyw * rayDelta.z + rayBeg.xyw; zNext.z = rayRound.z;
+
+	int3 ijkStep = sign(rayDir);
+
+	float4 rayCurr = rayBeg;
+	while (!any((ijk)& ~(gridSize - 1)) && rayCurr.w < rayEnd.w)
+	{
+		float4 rayNext;
+		float w = min(xNext.w, min(yNext.w, zNext.w));
+		if (rayEnd.w <= w)
+		{
+			rayNext = rayEnd;
+		}
+		else
+		{
+			rayNext = (w == xNext.w) ? xNext : (w == yNext.w) ? yNext : zNext;
+		}
+
+#if SKIP_EMPTY_BRICKS
+		if (sampleBrickMap(ijk))
+#endif
+		{
+			if (traceBrick(callback, rayCurr, rayNext, rayDir, ijk))
+			{
+				return true;
+			}
+		}
+
+		int3 comp = int3(w == xNext.w, w == yNext.w, w == zNext.w);
+		ijk += comp * ijkStep;
+		xNext += comp.x * xStep;
+		yNext += comp.y * yStep;
+		zNext += comp.z * zStep;
+
+		rayCurr = rayNext;
+	}
+	return false;
+}
+
+float getSurfaceValue(float3 surfPos)
+{
+	const float3 TexelSize = float3(1.0f / R_DOMAIN_SIZE_X, 1.0f / R_DOMAIN_SIZE_Y, 1.0f / R_DOMAIN_SIZE_Z);
+	float3 tpos = (surfPos + 0.5f) * TexelSize;
+
+	return LiquidSurfaceTexture.SampleLevel(LiquidSurfaceTextureSampler, tpos, 0) - R_LEVEL_VALUE;
+}

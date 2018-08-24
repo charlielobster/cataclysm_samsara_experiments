@@ -1,0 +1,202 @@
+// Size of the particle texture resources
+#if 0 // do 1024^2 particle resources
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_X 1024
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_Y 1024
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_X 10
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y 10
+
+#elif 1 // do 1024x2048 particle resources
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_X 1024
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_Y 2048
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_X 10
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y 11
+
+#else // do 2048^2 particle resources
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_X 2048
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_Y 2048
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_X 11
+#define GPU_PARTICLE_SIM_TEXTURE_SIZE_BITS_Y 11
+
+#endif
+
+// LS_MILTIPLIER must be 1 or 2 only.
+#define LS_MULTIPLIER 2
+#define SURFACE_LEVELSET_AT (-4.0)
+ 
+// May only have one domain size, all others must be 0
+#define USE_SMALL_DOMAIN 0
+#define USE_MEDIUM_DOMAIN 0
+#define USE_LARGE_DOMAIN 0
+#define USE_ALPHA_DOMAIN 1
+#define USE_HUGE_DOMAIN 0
+
+// The maximum number of voxels in each dimension, restricted by the maximum size that Texture3D can use, which is restricted by D3D11_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+// https://msdn.microsoft.com/en-us/library/windows/desktop/ff819065(v=vs.85).aspx
+#if USE_SMALL_DOMAIN
+#define DOMAIN_SIZE_X 256
+#define DOMAIN_SIZE_Y 512
+#define DOMAIN_SIZE_Z 64
+
+#elif USE_MEDIUM_DOMAIN
+#define DOMAIN_SIZE_X 256
+#define DOMAIN_SIZE_Y 512
+#define DOMAIN_SIZE_Z 128
+
+#elif USE_HUGE_DOMAIN
+#define DOMAIN_SIZE_X 2048
+#define DOMAIN_SIZE_Y 2048
+#define DOMAIN_SIZE_Z 1024
+
+#elif USE_ALPHA_DOMAIN
+#define DOMAIN_SIZE_X 1024
+#define DOMAIN_SIZE_Y 1024
+#define DOMAIN_SIZE_Z 512
+
+#else // USE_LARGE_DOMAIN
+#define DOMAIN_SIZE_X 512
+#define DOMAIN_SIZE_Y 512
+#define DOMAIN_SIZE_Z 256
+
+#endif
+
+#define DOMAIN_SIZE (DOMAIN_SIZE_X*DOMAIN_SIZE_Y*DOMAIN_SIZE_Z)
+
+// The size in voxels of the bricks.  
+// These are not the same as the tile sizes in the VTR resources, those will depend on the format in the VTR. 
+#define USE_SMALL_BRICKS 1
+// do 4x4x4 bricks 
+#if USE_SMALL_BRICKS
+#define BRICK_SIZE_X 4
+#define BRICK_SIZE_Y 4
+#define BRICK_SIZE_Z 4
+
+#define BRICK_SIZE_BITS_X 2
+#define BRICK_SIZE_BITS_Y 2
+#define BRICK_SIZE_BITS_Z 2
+
+// bits in DOMAIN_SIZE_X/BRICK_SIZE_X - 1
+#if USE_SMALL_DOMAIN
+#define BRICK_IDX_BITS_X  6 
+#define BRICK_IDX_BITS_Y  7
+#define BRICK_IDX_BITS_Z  4
+
+#elif USE_MEDIUM_DOMAIN
+#define BRICK_IDX_BITS_X  6 
+#define BRICK_IDX_BITS_Y  7
+#define BRICK_IDX_BITS_Z  5
+
+#elif USE_HUGE_DOMAIN
+#define BRICK_IDX_BITS_X  9 
+#define BRICK_IDX_BITS_Y  9
+#define BRICK_IDX_BITS_Z  8
+
+#elif USE_ALPHA_DOMAIN
+#define BRICK_IDX_BITS_X  8 
+#define BRICK_IDX_BITS_Y  8
+#define BRICK_IDX_BITS_Z  7
+
+#else // USE_LARGE_DOMAIN
+#define BRICK_IDX_BITS_X  7
+#define BRICK_IDX_BITS_Y  7
+#define BRICK_IDX_BITS_Z  6
+#endif
+
+#else // do 8x8x8 bricks
+#define BRICK_SIZE_X 8
+#define BRICK_SIZE_Y 8
+#define BRICK_SIZE_Z 8
+
+#define BRICK_SIZE_BITS_X 3
+#define BRICK_SIZE_BITS_Y 3
+#define BRICK_SIZE_BITS_Z 3
+
+// bits in DOMAIN_SIZE_X/BRICK_SIZE_X - 1
+#if USE_SMALL_DOMAIN
+#define BRICK_IDX_BITS_X  5 
+#define BRICK_IDX_BITS_Y  6
+#define BRICK_IDX_BITS_Z  3
+
+#elif USE_MEDIUM_DOMAIN
+#define BRICK_IDX_BITS_X  5 
+#define BRICK_IDX_BITS_Y  6
+#define BRICK_IDX_BITS_Z  4
+
+#elif USE_HUGE_DOMAIN
+#define BRICK_IDX_BITS_X  8 
+#define BRICK_IDX_BITS_Y  8
+#define BRICK_IDX_BITS_Z  7
+
+#elif USE_ALPHA_DOMAIN
+#define BRICK_IDX_BITS_X  7 
+#define BRICK_IDX_BITS_Y  7
+#define BRICK_IDX_BITS_Z  6
+
+#else // USE_LARGE_DOMAIN
+#define BRICK_IDX_BITS_X  6
+#define BRICK_IDX_BITS_Y  6
+#define BRICK_IDX_BITS_Z  5
+
+#endif
+
+#endif
+
+#define BRICK_SIZE_MASK_X (BRICK_SIZE_X - 1)
+
+
+#define NUM_BRICKS_X (1<<BRICK_IDX_BITS_X)
+#define NUM_BRICKS_Y (1<<BRICK_IDX_BITS_Y)
+#define NUM_BRICKS_Z (1<<BRICK_IDX_BITS_Z)
+#define NUM_BRICKS (NUM_BRICKS_X*NUM_BRICKS_Y*NUM_BRICKS_Z)
+
+#define BRICK_IDX_MASK (NUM_BRICKS - 1)
+#define BRICK_IDX_MASK_X (NUM_BRICKS_X - 1)
+#define BRICK_IDX_MASK_Y (NUM_BRICKS_Y - 1)
+#define BRICK_IDX_MASK_Z (NUM_BRICKS_Z - 1)
+
+#define CTA_SIZE_X  4
+#define CTA_SIZE_Y  4
+#define CTA_SIZE_Z  4
+
+#define NEAREST_PARTICLE_THREAD_COUNT 256
+#define PARTICLE_SPLAT_THREAD_COUNT 32
+#define CREATE_BRICK_MAP_THREADS_COUNT 128
+#define GET_BRICK_DATA_THREAD_COUNT 128
+#define GENERATE_PARTICLES_GRID_THREAD_COUNT 256
+#define PRESSURE_SOLVE_THREADS 256
+#define PARTICLES_TO_GRID_THREADS 32
+#define POS_IN_VOX_THREADS 32
+#define LEVELSET_SPLAT_THREADS 32
+
+// sqrt(3)
+#define SQRT_OF_3 1.733
+// sqrt(3)/2
+#define SQRT_OF_3_OVER_2 0.866
+
+// Onlt the first MAX_SPLAT_COUNT particles are splatted per cell.  SPLAT_ALL_PARTICLES is possible if we add another splat pass after the first it would probably be fastest.
+#define MAX_SPLAT_COUNT 12
+
+#define LS_DOMAIN_SIZE_X (DOMAIN_SIZE_X*LS_MULTIPLIER)
+#define LS_DOMAIN_SIZE_Y (DOMAIN_SIZE_Y*LS_MULTIPLIER)
+#define LS_DOMAIN_SIZE_Z (DOMAIN_SIZE_Z*LS_MULTIPLIER)
+#define LS_BRICK_SIZE_X (BRICK_SIZE_X*LS_MULTIPLIER)
+#define LS_BRICK_SIZE_Y (BRICK_SIZE_Y*LS_MULTIPLIER)
+#define LS_BRICK_SIZE_Z (BRICK_SIZE_Z*LS_MULTIPLIER)
+
+#define LS_BRICK_SIZE_BITS_X (BRICK_SIZE_BITS_X+LS_MULTIPLIER-1)
+#define LS_BRICK_SIZE_BITS_Y (BRICK_SIZE_BITS_Y+LS_MULTIPLIER-1)
+#define LS_BRICK_SIZE_BITS_Z (BRICK_SIZE_BITS_Z+LS_MULTIPLIER-1)
+
+#define MAX_FLUID_TRIGGERS	16
+#define MAX_FLUID_FIELDS	16
+#define MAX_FLUID_REGIONS	(MAX_FLUID_TRIGGERS + MAX_FLUID_FIELDS)
+
+#define PARTICLES_TEX_COORDS_COUNT 2
+#define FFT_WAVES_LENGTH_PERIOD 500.0f
+
+#define NUM_FOAM_SAMPLES 16
+
+//DPARTICLES_SCAN_WG_SIZE should be multiple of 128 (= WARP_SIZE * 4) !!!
+#define DPARTICLES_SCAN_WG_SIZE 512
+#define DPARTICLES_COMPACT_WG_SIZE 512
+#define DPARTICLES_SIMULATE_WG_SIZE 512
+#define DPARTICLES_APPEND_WG_SIZE 512
